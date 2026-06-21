@@ -25,3 +25,7 @@ coverage/
 *.log
 *.tmp
 .DS_Store
+
+# agent
+.codegraph
+AGENTS.md
