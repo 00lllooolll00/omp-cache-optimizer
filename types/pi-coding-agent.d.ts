@@ -1,4 +1,4 @@
-declare module "@earendil-works/pi-coding-agent" {
+declare module "@oh-my-pi/pi-coding-agent" {
   export type BuildSystemPromptOptions = {
     customPrompt?: string;
     appendSystemPrompt?: string;
@@ -43,14 +43,20 @@ declare module "@earendil-works/pi-coding-agent" {
       select(title: string, options: string[]): Promise<string | undefined>;
     };
     hasUI?: boolean;
+    cwd?: string;
   };
 
   export type CommandContext = ExtensionContext & { hasUI?: boolean };
 
+  // omp extension events. before_agent_start in omp returns { message? } (inject a
+  // custom message), NOT a mutated systemPrompt. Prompt rewriting must happen in
+  // before_provider_request, which may replace the provider request payload.
+  // turn_start replaces Pi's model_select for footer/status updates (model_select
+  // is not listed in omp hooks.md/extensions.md event surfaces).
   export type ExtensionAPI = {
     on(event: "session_start", handler: (event: { reason?: string }, ctx: ExtensionContext) => unknown): void;
-    on(event: "model_select", handler: (event: { model?: ExtensionModel }, ctx: ExtensionContext) => unknown): void;
-    on(event: "before_agent_start", handler: (event: { systemPrompt: string; systemPromptOptions: BuildSystemPromptOptions }, ctx: ExtensionContext) => unknown): void;
+    on(event: "before_agent_start", handler: (event: { systemPrompt?: string; systemPromptOptions?: BuildSystemPromptOptions }, ctx: ExtensionContext) => unknown): void;
+    on(event: "turn_start", handler: (event: Record<string, unknown>, ctx: ExtensionContext) => unknown): void;
     on(event: "before_provider_request", handler: (event: { payload: unknown }, ctx: ExtensionContext) => unknown): void;
     on(event: "after_provider_response", handler: (event: { status: number; headers?: Record<string, string> }, ctx: ExtensionContext) => unknown): void;
     on(event: "message_end", handler: (event: { message: unknown }, ctx: ExtensionContext) => unknown): void;

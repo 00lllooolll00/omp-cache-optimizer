@@ -1,9 +1,11 @@
 {
-  "name": "pi-cache-optimizer",
-  "version": "2.6.7",
-  "description": "Improve Pi prompt/KV cache hit rates with stable prompts, OpenAI-compatible cache keys, proxy compat warnings, and footer cache stats.",
+  "name": "omp-cache-optimizer",
+  "version": "1.0.0",
+  "description": "Improve OMP prompt/KV cache hit rates with stable prompts, OpenAI-compatible cache keys, proxy compat warnings, and footer cache stats.",
   "keywords": [
-    "pi-package",
+    "omp-package",
+    "omp",
+    "oh-my-pi",
     "deepseek",
     "openai",
     "claude",
@@ -13,22 +15,27 @@
     "prompt-cache",
     "optimizer"
   ],
-  "author": "freescheme",
+  "author": "n1netynine99",
   "license": "MIT",
   "files": [
     "index.ts"
   ],
-  "pi": {
+  "omp": {
     "extensions": [
       "./index.ts"
     ],
-    "image": "https://img.shields.io/badge/Pi-Cache%20Optimizer-4A90D9"
+    "image": "https://img.shields.io/badge/OMP-Cache%20Optimizer-4A90D9"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "*"
+    "@oh-my-pi/pi-coding-agent": "*"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/jiangge/pi-cache-optimizer.git"
+    "url": "git+https://github.com/n1netynine99/omp-cache-optimizer.git"
   }
 }

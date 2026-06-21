@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { copyFile, mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import type { BuildSystemPromptOptions, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { BuildSystemPromptOptions, ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 
 type MutableEnv = Record<string, string | undefined>;
 
@@ -38,21 +38,21 @@ function restoreCacheRetentionEnv(snapshot: CacheRetentionEnvSnapshot, env: Muta
 const STARTUP_CACHE_RETENTION_ENV = captureCacheRetentionEnv();
 
 /**
- * Pi Cache Optimizer (formerly pi-deepseek-cache-optimizer)
+ * OMP Cache Optimizer (fork of pi-cache-optimizer for oh-my-pi)
  *
  * What it does:
- * 1. Reorders Pi's system prompt so stable content is sent before dynamic context.
- * 2. Sets PI_CACHE_RETENTION=long at extension load time.
+ * 1. Reorders OMP's system prompt so stable content is sent before dynamic context.
+ * 2. Sets PI_CACHE_RETENTION=long at extension load time (OMP honors the same env).
  * 3. Warns once for provider/model cache compat gaps where the signal is conservative.
- * 4. Shows lightweight persisted provider-specific cache stats in Pi's footer.
+ * 4. Shows lightweight persisted provider-specific cache stats in OMP's footer.
  *
  * Provider prompt/KV caches are provider-side and best-effort. This extension improves
  * the odds of cache hits; it cannot guarantee hits, especially through proxies.
  */
 
 // ============================================================
-// Automatically request long prompt-cache retention when Pi supports it.
-// /cache-optimizer disable restores the startup value for this Pi process.
+// Automatically request long prompt-cache retention when OMP supports it.
+// /cache-optimizer disable restores the startup value for this OMP process.
 // ============================================================
 requestLongCacheRetention();
 
@@ -60,19 +60,27 @@ type PiModel = NonNullable<ExtensionContext["model"]>;
 type UnknownRecord = Record<string, unknown>;
 type CacheProviderId = "deepseek" | "openai" | "claude" | "gemini";
 
-const LOG_PREFIX = "pi-cache-optimizer";
-const STATUS_KEY = "pi-cache-stats";
-const STATE_DIR = join(homedir(), ".pi", "agent");
-const STATE_FILE_PATH = join(STATE_DIR, "pi-cache-optimizer-stats.json");
+const LOG_PREFIX = "omp-cache-optimizer";
+const STATUS_KEY = "omp-cache-stats";
+const STATE_DIR = join(homedir(), ".omp", "agent");
+const STATE_FILE_PATH = join(STATE_DIR, "omp-cache-optimizer-stats.json");
+// Legacy Pi-era state file path: read for one-way migration only, never written.
+const LEGACY_PI_STATE_FILE_PATH = join(homedir(), ".pi", "agent", "pi-cache-optimizer-stats.json");
 const LEGACY_STATE_FILE_PATH = join(STATE_DIR, "deepseek-cache-optimizer-stats.json");
 const CACHE_PROVIDER_IDS: CacheProviderId[] = ["deepseek", "openai", "claude", "gemini"];
+// Env var names keep the PI_CACHE_OPTIMIZER_* prefix: OMP mirrors OMP_* -> PI_* in
+// every .env file (see omp environment-variables.md §2), so these remain the single
+// source of truth and OMP_CACHE_OPTIMIZER_* aliases resolve transparently.
 const OPENAI_CACHE_KEY_ENV = "PI_CACHE_OPTIMIZER_OPENAI_CACHE_KEY";
 const NO_OPENAI_CACHE_KEY_ENV = "PI_CACHE_OPTIMIZER_NO_OPENAI_CACHE_KEY";
 const OPENAI_PROMPT_CACHE_KEY_MAX_LENGTH = 64;
 const NO_SKILL_COMPRESSION_ENV = "PI_CACHE_OPTIMIZER_NO_SKILL_COMPRESSION";
 const NO_PROMPT_REWRITE_ENV = "PI_CACHE_OPTIMIZER_NO_PROMPT_REWRITE";
-const PI_ROUTING_REGISTRY_SYMBOL = Symbol.for("pi.routing.registry.v1");
-const PI_CACHE_HINTS_SYMBOL = Symbol.for("pi.cache.hints.v1");
+// Inter-extension protocol symbols are versioned under the omp.* namespace. The v1
+// shape is identical to the legacy pi.* symbols; router/hints integrators on OMP
+// should register under omp.routing.registry.v1 / omp.cache.hints.v1.
+const PI_ROUTING_REGISTRY_SYMBOL = Symbol.for("omp.routing.registry.v1");
+const PI_CACHE_HINTS_SYMBOL = Symbol.for("omp.cache.hints.v1");
 
 let runtimeOptimizerEnabled = true;
 
@@ -140,13 +148,15 @@ const AYA_MODEL_PATTERN = /(^|[\/\s:_-])aya($|[\-_.:\/\s])/i;
 const ORION_MODEL_PATTERN = /(^|[\/\s:_-])orion($|[\-_.:\/\s])/i;
 
 type CacheCompat = {
-  sendSessionAffinityHeaders?: boolean;
-  sendSessionIdHeader?: boolean;
-  supportsLongCacheRetention?: boolean;
+  // OMP compat fields (see omp models.md). Pi-era field names are remapped:
+  //   sendSessionAffinityHeaders / sendSessionIdHeader  -> removed (use headers/extraBody)
+  //   forceAdaptiveThinking                            -> removed (OMP catalog sets it internally)
+  //   supportsLongCacheRetention                       -> supportsLongPromptCacheRetention
+  //   requiresReasoningContentOnAssistantMessages      -> requiresReasoningContentForToolCalls
+  supportsLongPromptCacheRetention?: boolean;
   thinkingFormat?: string;
-  requiresReasoningContentOnAssistantMessages?: boolean;
+  requiresReasoningContentForToolCalls?: boolean;
   cacheControlFormat?: string;
-  forceAdaptiveThinking?: boolean;
 };
 
 type CacheStats = {
@@ -230,8 +240,8 @@ type PiCacheHintsV1 = {
 };
 
 type ProtocolGlobal = typeof globalThis & Record<symbol, unknown> & {
-  __piCacheOptimizerRouter?: unknown;
-  __piCacheOptimizerCacheKey__?: unknown;
+  __ompCacheOptimizerRouter?: unknown;
+  __ompCacheOptimizerCacheKey__?: unknown;
 };
 
 type ModelRegistryLike = {
@@ -828,8 +838,8 @@ function resolveActiveRouteSnapshot(
   }
 
   // Temporary migration shim for the prototype global used by early router PRs.
-  // New integrations should use Symbol.for("pi.routing.registry.v1") instead.
-  const legacy = getProtocolGlobal().__piCacheOptimizerRouter;
+  // New integrations should use Symbol.for("omp.routing.registry.v1") instead.
+  const legacy = getProtocolGlobal().__ompCacheOptimizerRouter;
   if (!legacy || !lower(model.provider).includes("router")) return undefined;
   try {
     if (typeof legacy === "function") {
@@ -954,7 +964,7 @@ function getNonNegativeNumber(record: UnknownRecord, key: string): number | unde
 /**
  * Get effective compat for a model by merging provider-level and model-level compat.
  * Model-level compat takes precedence over provider-level compat for overlapping keys.
- * This matches Pi's model-registry.js mergeCompat behavior.
+ * This matches OMP's model-registry.js mergeCompat behavior.
  */
 function getCompat(model: PiModel | undefined): CacheCompat {
   if (!model) return {} as CacheCompat;
@@ -970,23 +980,23 @@ function getCompat(model: PiModel | undefined): CacheCompat {
 }
 
 /**
- * Return a platform-friendly display path for `~/.pi/agent/models.json`.
+ * Return a platform-friendly display path for `~/.omp/agent/models.yml`.
  *
  * On Windows (platform starts with "win") the path is shown as
- * `%USERPROFILE%\.pi\agent\models.json` to match Windows conventions.
+ * `%USERPROFILE%\.omp\agent\models.yml` to match Windows conventions.
  * On all other platforms (Linux, macOS, etc.) it is shown as
- * `~/.pi/agent/models.json` (the Unix-style tilde shorthand).
+ * `~/.omp/agent/models.yml` (the Unix-style tilde shorthand).
  *
- * This is a DISPLAY helper only. Actual path resolution is done by Pi
+ * This is a DISPLAY helper only. Actual path resolution is done by OMP
  * (via Node `os.homedir()` + path.join), and this string is never used
  * for I/O — only for warning/doctor/README text so that users on any
  * platform see a copyable path they recognize.
  */
 function getModelsJsonDisplayPath(platform: string = process.platform): string {
   if (platform.startsWith("win")) {
-    return `%USERPROFILE%\\.pi\\agent\\models.json`;
+    return `%USERPROFILE%\\.omp\\agent\\models.yml`;
   }
-  return "~/.pi/agent/models.json";
+  return "~/.omp/agent/models.yml";
 }
 
 function isEnabledEnv(value: string | undefined): boolean {
@@ -1031,7 +1041,7 @@ function getOptimizerRuntimeModeLines(): string[] {
   lines.push(`• Compat warnings: ${runtimeOptimizerEnabled ? "on" : "off"}`);
   lines.push(`• ${PI_CACHE_RETENTION_ENV}: ${process.env[PI_CACHE_RETENTION_ENV] ?? "(unset)"}`);
   if (!runtimeOptimizerEnabled) {
-    lines.push("This is a current-process switch. Run /reload or restart Pi to return to startup behavior.");
+    lines.push("This is a current-process switch. Run /reload or restart OMP to return to startup behavior.");
   } else if (isEnabledEnv(process.env[NO_PROMPT_REWRITE_ENV]) || !shouldInjectOpenAIPromptCacheKey()) {
     lines.push("Some features are still disabled by environment variables.");
   }
@@ -1149,51 +1159,44 @@ function isAdaptiveGenerationModel(model: PiModel | undefined): boolean {
   return tokens.some((t) => ADAPTIVE_OPUS_PATTERN.test(t) || ADAPTIVE_SONNET_PATTERN.test(t) || ADAPTIVE_FABLE_PATTERN.test(t));
 }
 
-function isAdaptiveThinkingCompatApplicable(model: PiModel): boolean {
-  return lower(model.api) === "anthropic-messages" && isAdaptiveGenerationModel(model);
+// OMP divergence: adaptive thinking is set automatically by the OMP built-in model
+// catalog (via disableAdaptiveThinking, with reversed semantics) and is NOT
+// user-configurable from models.yml (see omp models.md §Anthropic compatibility).
+// The Pi-era forceAdaptiveThinking flag no longer exists. We keep model detection
+// (isAdaptiveGenerationModel) for informational doctor output, but drop the fixable
+// compat-suggestion path entirely.
+function isAdaptiveThinkingCompatApplicable(_model: PiModel): boolean {
+  return false;
 }
 
-function describeMissingAdaptiveThinkingCompat(model: PiModel): string[] {
-  const compat = getCompat(model);
-  const missing: string[] = [];
-  if (compat.forceAdaptiveThinking !== true) {
-    missing.push("forceAdaptiveThinking");
-  }
-  return missing;
+function describeMissingAdaptiveThinkingCompat(_model: PiModel): string[] {
+  return [];
 }
 
-function buildAdaptiveThinkingCompatSuggestion(missing: string[]): Record<string, unknown> {
-  const suggestion: Record<string, unknown> = {};
-  if (missing.includes("forceAdaptiveThinking")) {
-    suggestion.forceAdaptiveThinking = true;
-  }
-  return suggestion;
+function buildAdaptiveThinkingCompatSuggestion(_missing: string[]): Record<string, unknown> {
+  return {};
 }
 
-function appendAdaptiveThinkingCompatAdviceLines(lines: string[], missing: string[], placement: CompatAdvicePlacement = {}): void {
-  const suggestion = buildAdaptiveThinkingCompatSuggestion(missing);
-  if (Object.keys(suggestion).length > 0) {
-    lines.push("Suggested fix:");
-    lines.push(JSON.stringify(suggestion, null, 2));
-  }
-  lines.push("- forceAdaptiveThinking: true tells Pi to use adaptive thinking format");
-  lines.push("  (thinking: {type: 'adaptive'}) instead of legacy budget tokens format.");
-  lines.push("  Without this flag, Pi sends legacy thinking which adaptive-only upstreams reject.");
-  appendCredentialSafeProviderGuidance(lines, placement, suggestion);
+function appendAdaptiveThinkingCompatAdviceLines(lines: string[], _missing: string[], placement: CompatAdvicePlacement = {}): void {
+  lines.push("- Adaptive thinking: OMP's built-in model catalog sets this automatically for official Claude models.");
+  lines.push("  Custom channels fronting Anthropic should rely on the bundled catalog metadata;");
+  lines.push("  if the upstream rejects adaptive thinking, verify the model id matches an official release.");
+  appendCredentialSafeProviderGuidance(lines, placement, {});
 }
 
-function buildAdaptiveThinkingCompatWarningText(key: string, missing: string[]): string {
+function buildAdaptiveThinkingCompatWarningText(key: string, _missing: string[]): string {
   const slashIdx = key.indexOf("/");
   const providerLabel = slashIdx > 0 ? key.slice(0, slashIdx) : key;
   const modelId = slashIdx > 0 ? key.slice(slashIdx + 1) : undefined;
   const modelsJsonPath = getModelsJsonDisplayPath();
   const lines: string[] = [
-    `💡 pi-cache-optimizer: ${key} is an adaptive-generation Claude model but merged compat lacks ${missing.join(" and ")}.`,
-    `Without this flag, Pi sends legacy thinking format that may be rejected by the upstream.`,
-    `Edit ${modelsJsonPath} -> providers["${providerLabel}"] -> compat (at the same level as baseUrl/api/apiKey/models).`,
+    `ℹ️ omp-cache-optimizer: ${key} is an adaptive-generation Claude model.`,
+    `OMP's built-in catalog handles adaptive thinking automatically; no models.yml compat key is needed`,
+    `for official models. Custom channels fronting Anthropic may need explicit catalog metadata.`,
+    `See ${modelsJsonPath} -> providers["${providerLabel}"] -> models -> "${modelId ?? "<id>"}".`,
     "",
   ];
-  appendAdaptiveThinkingCompatAdviceLines(lines, missing, { providerLabel, modelId });
+  appendAdaptiveThinkingCompatAdviceLines(lines, [], { providerLabel, modelId });
   return lines.join("\n");
 }
 
@@ -1888,6 +1891,131 @@ function addOpenAIPromptCacheKey(payload: unknown, cacheKey: string | undefined)
   return { ...record, prompt_cache_key: normalizedCacheKey };
 }
 
+// ── System prompt extraction/insertion for before_provider_request ──
+//
+// OMP divergence: prompt rewriting moved from before_agent_start to
+// before_provider_request. The provider payload shape varies by API:
+//   - openai-completions / openai-responses: payload.messages[] with role=system
+//   - anthropic-messages: payload.system (string or array of blocks)
+//   - google-generative-ai: payload.systemInstruction
+// We probe for each shape and return the first match. setSystemPrompt writes
+// back into the same shape it was extracted from.
+
+function extractSystemPrompt(payload: unknown): string | undefined {
+  const record = asRecord(payload);
+  if (!record) return undefined;
+
+  // anthropic-messages: payload.system (string or content blocks array)
+  const systemField = record.system;
+  if (typeof systemField === "string") return systemField;
+  if (Array.isArray(systemField)) {
+    return systemField
+      .map((block) => {
+        const r = asRecord(block);
+        if (!r) return "";
+        if (typeof r.text === "string") return r.text;
+        return "";
+      })
+      .join("\n")
+      .trim() || undefined;
+  }
+
+  // google-generative-ai: payload.systemInstruction
+  const systemInstruction = asRecord(record.systemInstruction);
+  if (systemInstruction) {
+    const parts = systemInstruction.parts;
+    if (Array.isArray(parts)) {
+      const text = parts
+        .map((p) => {
+          const r = asRecord(p);
+          return typeof r?.text === "string" ? r.text : "";
+        })
+        .join("\n")
+        .trim();
+      if (text) return text;
+    }
+  }
+
+  // openai-completions / openai-responses: payload.messages[] first system message
+  const messages = record.messages;
+  if (Array.isArray(messages)) {
+    for (const msg of messages) {
+      const r = asRecord(msg);
+      if (!r) continue;
+      if (r.role === "system" || r.role === "developer") {
+        if (typeof r.content === "string") return r.content;
+        if (Array.isArray(r.content)) {
+          const text = r.content
+            .map((c) => {
+              const cr = asRecord(c);
+              return typeof cr?.text === "string" ? cr.text : "";
+            })
+            .join("\n")
+            .trim();
+          if (text) return text;
+        }
+      }
+    }
+  }
+
+  return undefined;
+}
+
+function setSystemPrompt(payload: unknown, text: string): boolean {
+  const record = asRecord(payload);
+  if (!record) return false;
+
+  // anthropic-messages: payload.system
+  if (typeof record.system === "string") {
+    record.system = text;
+    return true;
+  }
+  if (Array.isArray(record.system) && record.system.length > 0) {
+    // Replace first text block, keep structure
+    const first = asRecord(record.system[0]);
+    if (first && typeof first.text === "string") {
+      first.text = text;
+      return true;
+    }
+    // Fallback: convert to single-block string form
+    record.system = [{ type: "text", text }];
+    return true;
+  }
+
+  // google-generative-ai: payload.systemInstruction
+  const systemInstruction = asRecord(record.systemInstruction);
+  if (systemInstruction && Array.isArray(systemInstruction.parts) && systemInstruction.parts.length > 0) {
+    const firstPart = asRecord(systemInstruction.parts[0]);
+    if (firstPart && typeof firstPart.text === "string") {
+      firstPart.text = text;
+      return true;
+    }
+  }
+
+  // openai-completions / openai-responses: payload.messages[] first system/developer message
+  const messages = record.messages;
+  if (Array.isArray(messages)) {
+    for (const msg of messages) {
+      const r = asRecord(msg);
+      if (!r) continue;
+      if (r.role === "system" || r.role === "developer") {
+        if (typeof r.content === "string") {
+          r.content = text;
+          return true;
+        }
+        if (Array.isArray(r.content) && r.content.length > 0) {
+          const first = asRecord(r.content[0]);
+          if (first && typeof first.text === "string") {
+            first.text = text;
+            return true;
+          }
+        }
+      }
+    }
+  }
+
+  return false;
+}
 function hasEffectivePromptCacheKey(record: UnknownRecord): boolean {
   return isNonEmptyString(record.prompt_cache_key) || isNonEmptyString(record.promptCacheKey);
 }
@@ -1909,19 +2037,13 @@ function isOfficialOpenAIBaseUrl(model: PiModel): boolean {
   }
 }
 
-function describeMissingOpenAIFamilyProxyCompat(model: PiModel): string[] {
-  const compat = getCompat(model);
-  const missing: string[] = [];
-
-  if (!isOpenAIFamilyModel(model)) return missing;
-  if (!isOpenAICompatibleProxyApi(model.api)) return missing;
-  if (isOfficialOpenAIBaseUrl(model)) return missing;
-
-  if (compat.sendSessionAffinityHeaders !== true) {
-    missing.push("sendSessionAffinityHeaders");
-  }
-
-  return missing;
+function describeMissingOpenAIFamilyProxyCompat(_model: PiModel): string[] {
+  // OMP divergence: Pi's sendSessionAffinityHeaders has no compat equivalent.
+  // OMP achieves upstream stickiness via multi-credential auth + session affinity
+  // in agent.db (see omp models.md §Auth). There is no required compat key for
+  // OpenAI-family proxies on OMP, so this returns an empty list. Optional long
+  // cache retention is reported separately by describeOptionalOpenAICompatibleProxyCompat.
+  return [];
 }
 
 /**
@@ -1930,18 +2052,10 @@ function describeMissingOpenAIFamilyProxyCompat(model: PiModel): string[] {
  * URL — covers GPT, Kimi, Qwen, GLM, MiniMax, Mimo, Hunyuan, and any other
  * OpenAI-compatible proxy.
  */
-function describeMissingOpenAICompatibleProxyCompat(model: PiModel): string[] {
-  const compat = getCompat(model);
-  const missing: string[] = [];
-
-  if (!isOpenAICompatibleProxyApi(model.api)) return missing;
-  if (isOfficialOpenAIBaseUrl(model)) return missing;
-
-  if (compat.sendSessionAffinityHeaders !== true) {
-    missing.push("sendSessionAffinityHeaders");
-  }
-
-  return missing;
+function describeMissingOpenAICompatibleProxyCompat(_model: PiModel): string[] {
+  // OMP divergence: no required compat key for OpenAI-compatible proxies.
+  // See describeMissingOpenAIFamilyProxyCompat for rationale.
+  return [];
 }
 
 function describeOptionalOpenAICompatibleProxyCompat(model: PiModel): string[] {
@@ -1951,23 +2065,22 @@ function describeOptionalOpenAICompatibleProxyCompat(model: PiModel): string[] {
   if (!isOpenAICompatibleProxyApi(model.api)) return optional;
   if (isOfficialOpenAIBaseUrl(model)) return optional;
 
-  if (compat.supportsLongCacheRetention !== true) {
-    optional.push("supportsLongCacheRetention");
+  if (compat.supportsLongPromptCacheRetention !== true) {
+    optional.push("supportsLongPromptCacheRetention");
   }
 
   return optional;
 }
 
-function buildSafeOpenAIProxyCompatSuggestion(missing: string[]): Record<string, boolean> {
-  const suggestion: Record<string, boolean> = {};
-  if (missing.includes("sendSessionAffinityHeaders")) {
-    suggestion.sendSessionAffinityHeaders = true;
-  }
-  return suggestion;
+function buildSafeOpenAIProxyCompatSuggestion(_missing: string[]): Record<string, boolean> {
+  // OMP divergence: no safe auto-fixable compat key for OpenAI-compatible proxies.
+  // supportsLongPromptCacheRetention is optional and can cause 400s, so it is NOT
+  // auto-fixed; users must add it manually after confirming upstream support.
+  return {};
 }
 
 function getPromptCacheRetentionUnsupportedHint(): string {
-  return "If this channel returns `400 Unsupported parameter: prompt_cache_retention`, remove/avoid `supportsLongCacheRetention`; this extension does not write that field directly, but Pi may send it when long retention is requested and compat says the proxy supports it.";
+  return "If this channel returns `400 Unsupported parameter: prompt_cache_retention`, remove/avoid `supportsLongPromptCacheRetention`; this extension does not write that field directly, but OMP may send it when long retention is requested and compat says the proxy supports it.";
 }
 
 function hasPromptCacheRetentionUnsupportedSignal(headers: Record<string, string> | undefined): boolean {
@@ -2021,7 +2134,7 @@ function appendCredentialSafeProviderGuidance(lines: string[], placement: Compat
   if (!providerLabel) return;
 
   lines.push("");
-  lines.push("If this channel has no models.json provider entry yet:");
+  lines.push("If this channel has no models.yml provider entry yet:");
   lines.push("- Keep existing authentication as-is; do not copy credentials, tokens, or API keys.");
   lines.push(`- Add only cache/routing compat overrides in ${getModelsJsonDisplayPath()}.`);
 
@@ -2050,17 +2163,16 @@ function appendOpenAIProxyCompatAdviceLines(lines: string[], missing: string[], 
     lines.push(JSON.stringify(suggestion, null, 2));
   }
 
-  if (missing.includes("sendSessionAffinityHeaders")) {
-    lines.push("- sendSessionAffinityHeaders: recommended for third-party proxies when supported; it helps keep one Pi session on the same upstream/backend.");
-  }
+  // OMP divergence: session affinity is handled by multi-credential auth, not compat.
+  // No per-flag advice lines remain; only the optional long-retention guidance below.
   appendCredentialSafeProviderGuidance(lines, options, suggestion);
 }
 
 function appendOptionalOpenAIProxyCompatAdviceLines(lines: string[], optional: string[]): void {
-  if (!optional.includes("supportsLongCacheRetention")) return;
+  if (!optional.includes("supportsLongPromptCacheRetention")) return;
   lines.push("");
   lines.push("Optional (not required, not auto-fixed):");
-  lines.push("- supportsLongCacheRetention: enable only after your endpoint/proxy explicitly supports OpenAI long prompt cache retention.");
+  lines.push("- supportsLongPromptCacheRetention: enable only after your endpoint/proxy explicitly supports OpenAI long prompt cache retention.");
   lines.push(`- ${getPromptCacheRetentionUnsupportedHint()}`);
 }
 
@@ -2085,7 +2197,7 @@ function buildOpenAIProxyCompatWarningText(key: string, missing: string[]): stri
 
   const modelsJsonPath = getModelsJsonDisplayPath();
   const lines: string[] = [
-    `💡 pi-cache-optimizer: ${key} is a third-party GPT/OpenAI-compatible proxy but merged compat lacks ${missing.join(" and ")}.`,
+    `💡 omp-cache-optimizer: ${key} is a third-party GPT/OpenAI-compatible proxy but merged compat lacks ${missing.join(" and ")}.`,
     `Edit ${modelsJsonPath} -> providers["${providerLabel}"] -> compat (at the same level as baseUrl/api/apiKey/models).`,
     ``,
   ];
@@ -2099,21 +2211,18 @@ function describeMissingDeepSeekCompat(model: PiModel): string[] {
   const compat = getCompat(model);
   const missing: string[] = [];
 
-  if (compat.supportsLongCacheRetention !== true) {
-    missing.push("supportsLongCacheRetention");
+  // OMP divergence: field names remapped (see CacheCompat).
+  //   supportsLongCacheRetention                  -> supportsLongPromptCacheRetention
+  //   requiresReasoningContentOnAssistantMessages -> requiresReasoningContentForToolCalls
+  //   sendSessionAffinityHeaders / sendSessionIdHeader -> removed (OMP multi-credential auth)
+  //   thinkingFormat: "deepseek"                  -> not a valid OMP value; OMP uses
+  //     openai|openrouter|zai|qwen|qwen-chat-template. DeepSeek reasoning format is
+  //     auto-detected by OMP's openai-completions transport, so we no longer flag it.
+  if (compat.supportsLongPromptCacheRetention !== true) {
+    missing.push("supportsLongPromptCacheRetention");
   }
-  if (model.api === "openai-responses") {
-    if (compat.sendSessionIdHeader !== true) {
-      missing.push("sendSessionIdHeader");
-    }
-  } else if (compat.sendSessionAffinityHeaders !== true) {
-    missing.push("sendSessionAffinityHeaders");
-  }
-  if (compat.requiresReasoningContentOnAssistantMessages !== true) {
-    missing.push("requiresReasoningContentOnAssistantMessages");
-  }
-  if (compat.thinkingFormat !== "deepseek") {
-    missing.push("thinkingFormat");
+  if (compat.requiresReasoningContentForToolCalls !== true) {
+    missing.push("requiresReasoningContentForToolCalls");
   }
 
   return missing;
@@ -2136,20 +2245,11 @@ function describeMissingCacheCompatForModel(model: PiModel): string[] {
 function buildDeepSeekCompatSuggestion(missing: string[]): Record<string, unknown> {
   const suggestion: Record<string, unknown> = {};
 
-  if (missing.includes("supportsLongCacheRetention")) {
-    suggestion.supportsLongCacheRetention = true;
+  if (missing.includes("supportsLongPromptCacheRetention")) {
+    suggestion.supportsLongPromptCacheRetention = true;
   }
-  if (missing.includes("sendSessionIdHeader")) {
-    suggestion.sendSessionIdHeader = true;
-  }
-  if (missing.includes("sendSessionAffinityHeaders")) {
-    suggestion.sendSessionAffinityHeaders = true;
-  }
-  if (missing.includes("requiresReasoningContentOnAssistantMessages")) {
-    suggestion.requiresReasoningContentOnAssistantMessages = true;
-  }
-  if (missing.includes("thinkingFormat")) {
-    suggestion.thinkingFormat = "deepseek";
+  if (missing.includes("requiresReasoningContentForToolCalls")) {
+    suggestion.requiresReasoningContentForToolCalls = true;
   }
 
   return suggestion;
@@ -2162,21 +2262,16 @@ function appendDeepSeekCompatAdviceLines(lines: string[], missing: string[], pla
     lines.push(JSON.stringify(suggestion, null, 2));
   }
 
-  if (missing.includes("requiresReasoningContentOnAssistantMessages")) {
-    lines.push('- requiresReasoningContentOnAssistantMessages: true keeps replayed assistant turns compatible with DeepSeek reasoning_content requirements.');
+  if (missing.includes("requiresReasoningContentForToolCalls")) {
+    lines.push("- requiresReasoningContentForToolCalls: true keeps replayed assistant tool-call turns compatible with DeepSeek reasoning_content requirements.");
   }
-  if (missing.includes("thinkingFormat")) {
-    lines.push('- thinkingFormat: "deepseek" tells Pi to use DeepSeek reasoning/thinking parameter format.');
+  if (missing.includes("supportsLongPromptCacheRetention")) {
+    lines.push("- supportsLongPromptCacheRetention: enable for DeepSeek-compatible endpoints that support long cache retention.");
   }
-  if (missing.includes("sendSessionAffinityHeaders")) {
-    lines.push("- sendSessionAffinityHeaders: recommended for OpenAI-compatible DeepSeek proxies when supported; it helps keep one Pi session on the same upstream/backend.");
-  }
-  if (missing.includes("sendSessionIdHeader")) {
-    lines.push("- sendSessionIdHeader: recommended for OpenAI Responses-compatible DeepSeek proxies when supported.");
-  }
-  if (missing.includes("supportsLongCacheRetention")) {
-    lines.push("- supportsLongCacheRetention: enable for DeepSeek-compatible endpoints that support long cache retention.");
-  }
+  // OMP divergence: thinkingFormat is no longer flagged. DeepSeek reasoning format
+  // is auto-detected by OMP's openai-completions transport; the "deepseek" value
+  // is not a valid OMP thinkingFormat (OMP uses openai|openrouter|zai|qwen|...).
+  // Session affinity is handled by OMP multi-credential auth, not compat keys.
 
   appendCredentialSafeProviderGuidance(lines, placement, suggestion);
 }
@@ -2187,7 +2282,7 @@ function buildDeepSeekCompatWarningText(key: string, missing: string[]): string 
   const modelId = slashIdx > 0 ? key.slice(slashIdx + 1) : undefined;
   const modelsJsonPath = getModelsJsonDisplayPath();
   const lines: string[] = [
-    `💡 pi-cache-optimizer: ${key} is DeepSeek-like but merged compat lacks ${missing.join(" and ")}.`,
+    `💡 omp-cache-optimizer: ${key} is DeepSeek-like but merged compat lacks ${missing.join(" and ")}.`,
     `Proxies may reduce or hide cache hits. Edit ${modelsJsonPath} -> providers["${providerLabel}"] -> compat (at the same level as baseUrl/api/apiKey/models).`,
     "",
   ];
@@ -3180,22 +3275,9 @@ function notifyCacheCompatIfNeeded(
 ): void {
   if (!model) return;
 
-  // Native anthropic-messages adaptive thinking compat check.
-  // The Claude adapter's warningText only fires for OpenAI-compatible APIs,
-  // so native anthropic-messages models need a separate check.
-  if (lower(model.api) === "anthropic-messages" && isAdaptiveGenerationModel(model)) {
-    const compat = getCompat(model);
-    if (compat.forceAdaptiveThinking !== true) {
-      const key = `adaptive-thinking:${modelKey(model)}`;
-      if (!warnedModels.has(key)) {
-        warnedModels.add(key);
-        const missing = describeMissingAdaptiveThinkingCompat(model);
-        ctx.ui.notify(buildAdaptiveThinkingCompatWarningText(modelKey(model), missing), "warning");
-      }
-    }
-    // Still check adapter warnings for other compat issues.
-  }
-
+  // OMP divergence: adaptive thinking is set by the OMP built-in model catalog and
+  // is not user-configurable, so the native anthropic-messages compat check is gone.
+  // We only surface adapter warnings for OpenAI-compatible proxy compat gaps.
   const adapter = selectAdapterForModel(model);
   const text = adapter?.warningText?.(model);
   if (!adapter || !text) return;
@@ -3639,7 +3721,7 @@ function filterRestorableStatsForSession(
  *     id is known.
  *
  * Pure function (no I/O) — suitable for unit tests without touching the real
- * state file at `~/.pi/agent/pi-cache-optimizer-stats.json`.
+ * state file at `~/.omp/agent/omp-cache-optimizer-stats.json`.
  */
 function mergeCacheSessions(
   existingSessions: Record<string, Record<string, CacheStats>>,
@@ -3777,7 +3859,7 @@ function isCompatCheckApplicable(model: PiModel): boolean {
 function isPromptCacheRetention400Applicable(model: PiModel): boolean {
   return isOpenAICompatibleApi(model.api) &&
     !isOfficialOpenAIBaseUrl(model) &&
-    getCompat(model).supportsLongCacheRetention === true;
+    getCompat(model).supportsLongPromptCacheRetention === true;
 }
 
 /**
@@ -3837,10 +3919,10 @@ function describeRouterChannelDiagnostics(model: PiModel): string[] {
     if (!hasOnly && !hasOrder) {
       notes.push(
         "   Suggestion: Add an openRouterRouting config to fix the upstream provider. " +
-        "Example for models.json -> providers[\"<providerId>\"] -> compat:",
+        "Example for models.yml -> providers[\"<providerId>\"] -> compat:",
       );
       notes.push(
-        `   { "sendSessionAffinityHeaders": true, "supportsLongCacheRetention": true, ` +
+        `   { "supportsLongPromptCacheRetention": true, ` +
         `"openRouterRouting": { "only": ["<provider-slug>"] } }`,
       );
       notes.push(
@@ -3848,7 +3930,7 @@ function describeRouterChannelDiagnostics(model: PiModel): string[] {
       );
       notes.push(
         "   Alternatively, use openRouterRouting.order: [\"<provider-slug>\", \"...\"] for fallback order. " +
-        "Only set supportsLongCacheRetention if your upstream supports long cache retention.",
+        "Only set supportsLongPromptCacheRetention if your upstream supports long cache retention.",
       );
     }
 
@@ -3874,17 +3956,17 @@ function describeRouterChannelDiagnostics(model: PiModel): string[] {
     if (!hasOnly && !hasOrder) {
       notes.push(
         "   Suggestion: Add a vercelGatewayRouting config to fix the upstream. " +
-        "Example for models.json -> providers[\"<providerId>\"] -> compat:",
+        "Example for models.yml -> providers[\"<providerId>\"] -> compat:",
       );
       notes.push(
-        `   { "sendSessionAffinityHeaders": true, "supportsLongCacheRetention": true, ` +
+        `   { "supportsLongPromptCacheRetention": true, ` +
         `"vercelGatewayRouting": { "only": ["<provider-id>"] } }`,
       );
       notes.push(
         "   Replace <provider-id> with the actual Vercel provider ID (e.g. \"openai\").",
       );
       notes.push(
-        "   Only set supportsLongCacheRetention if your upstream supports it.",
+        "   Only set supportsLongPromptCacheRetention if your upstream supports it.",
       );
     }
 
@@ -3914,10 +3996,10 @@ function describeRouterChannelDiagnostics(model: PiModel): string[] {
       "   • Return cache usage fields (prompt_cache_hit_tokens, etc.) in the response.",
     );
     notes.push(
-      `   Safe compat default: { "sendSessionAffinityHeaders": true }`,
+      `   Safe compat default: { "supportsLongPromptCacheRetention": true }`,
     );
     notes.push(
-      `   Add supportsLongCacheRetention only if the proxy explicitly supports prompt_cache_retention.`,
+      `   Add supportsLongPromptCacheRetention only if the proxy explicitly supports prompt_cache_retention.`,
     );
 
     return notes;
@@ -4029,7 +4111,7 @@ function buildDoctorDiagnosis(model: PiModel, options: { promptCacheRetention400
   if (isPromptCacheRetention400Applicable(model)) {
     lines.push("");
     if (options.promptCacheRetention400) {
-      lines.push("⚠️  A 400 response was observed while supportsLongCacheRetention is enabled.");
+      lines.push("⚠️  A 400 response was observed while supportsLongPromptCacheRetention is enabled.");
       lines.push(`   ${getPromptCacheRetentionUnsupportedHint()}`);
     } else {
       lines.push(`ℹ️ Long retention is enabled. ${getPromptCacheRetentionUnsupportedHint()}`);
@@ -4153,7 +4235,7 @@ function buildLowHitDiagnosis(
       lines.push(`📉 Cache hit rate is low: ${todayHitRatio}% today (${recent10Total} recent samples).`);
       lines.push("   Likely causes: proxy routing to different backends per request,");
       lines.push("   or prompt prefix changes across turns.");
-      lines.push("   Verify session affinity (sendSessionAffinityHeaders) and long cache retention.");
+      lines.push("   Verify upstream routing stickiness and supportsLongPromptCacheRetention compat.");
     } else if (todayHitRatio < 30 && todayStats.totalRequests > 3) {
       lines.push(`📉 Cache hit rate is low: ${todayHitRatio}% today (${todayStats.totalRequests} total requests).`);
       lines.push("   Check compat flags and proxy upstream routing.");
@@ -4247,8 +4329,8 @@ function buildCompatDiagnosis(model: PiModel): string | undefined {
 // JSONC comment-preserving surgical edit helpers for /cache-optimizer fix
 // ============================================================
 
-/** The real models.json path used for I/O. */
-const MODELS_JSON_PATH = join(STATE_DIR, "models.json");
+/** The real models.yml path used for I/O. OMP stores model config as YAML, not JSONC. */
+const MODELS_JSON_PATH = join(STATE_DIR, "models.yml");
 
 // ── String-aware JSONC scanning primitives ─────────────────────────
 //
@@ -4258,6 +4340,7 @@ const MODELS_JSON_PATH = join(STATE_DIR, "models.json");
 // brackets inside string values (e.g. apiKeyCommand shell snippets) cannot
 // corrupt depth tracking.
 
+
 function isJsonWhitespace(ch: string): boolean {
   return ch === " " || ch === "\n" || ch === "\r" || ch === "\t";
 }
@@ -4266,7 +4349,6 @@ function skipJsonWhitespace(text: string, pos: number): number {
   while (pos < text.length && isJsonWhitespace(text[pos])) pos++;
   return pos;
 }
-
 /**
  * Read a JSON string literal starting at `pos` (which must be `"`).
  * Returns the decoded value and the offset just past the closing quote,
@@ -4543,7 +4625,7 @@ function parseJsonc(text: string): unknown {
 }
 
 /**
- * JSONC scanner: locate the provider block and model entry in models.json text.
+ * YAML scanner: locate the provider block and model entry in models.yml text.
  * Returns the byte offsets for surgical insertion, or undefined if ambiguous.
  */
 interface ModelNodeLocation {
@@ -4760,10 +4842,11 @@ function deepEqualIgnoringKeys(a: unknown, b: unknown, extraKeys: string[]): boo
  * These are always safe at the provider level because they do not change
  * per-model request semantics.
  */
+// OMP divergence: only supportsLongPromptCacheRetention remains as a provider-safe
+// compat key. Session affinity (sendSessionAffinityHeaders/sendSessionIdHeader) is
+// gone (OMP uses multi-credential auth), and forceAdaptiveThinking is catalog-driven.
 const PROVIDER_LEVEL_SAFE_COMPAT_KEYS = new Set<string>([
-  "sendSessionAffinityHeaders",
-  "sendSessionIdHeader",
-  "supportsLongCacheRetention",
+  "supportsLongPromptCacheRetention",
 ]);
 
 function syntheticModelForId(providerLabel: string, id: string): PiModel {
@@ -4800,12 +4883,9 @@ function decideFixPlacement(
   for (const key of Object.keys(compatKeys)) {
     if (PROVIDER_LEVEL_SAFE_COMPAT_KEYS.has(key)) continue;
 
-    if (key === "forceAdaptiveThinking") {
-      const allAdaptive = siblings.every((id) => isAdaptiveGenerationModel(syntheticModelForId(providerLabel, id)));
-      if (!allAdaptive) unsafeKeys.push(key);
-      continue;
-    }
-    if (key === "thinkingFormat" || key === "requiresReasoningContentOnAssistantMessages") {
+    // OMP divergence: forceAdaptiveThinking removed (catalog-driven).
+    // requiresReasoningContentForToolCalls renamed from requiresReasoningContentOnAssistantMessages.
+    if (key === "requiresReasoningContentForToolCalls") {
       const allDeepSeek = siblings.every((id) => isDeepSeekLikeModel(syntheticModelForId(providerLabel, id)));
       if (!allDeepSeek) unsafeKeys.push(key);
       continue;
@@ -5388,6 +5468,13 @@ export const __internals_for_tests = {
   buildAdaptiveThinkingCompatSuggestion,
   buildAdaptiveThinkingCompatWarningText,
   appendAdaptiveThinkingCompatAdviceLines,
+  // OMP migration: prompt rewrite helpers (new in fork)
+  extractSystemPrompt,
+  setSystemPrompt,
+  // Additional model detection + helpers for smoke tests
+  isDeepSeekLikeModel,
+  isClaudeLikeModel,
+  asRecord,
 };
 
 export default function (pi: ExtensionAPI) {
@@ -5405,6 +5492,13 @@ export default function (pi: ExtensionAPI) {
   let currentSessionHashSet = false;
   let lastActualRoutedModel: PersistedRoutedModelRef | undefined;
   let latestCacheHint: PiCacheHintSnapshot | undefined;
+  // OMP divergence: prompt rewriting moved from before_agent_start to
+  // before_provider_request (OMP's before_agent_start can only inject messages,
+  // not mutate systemPrompt). We cache systemPromptOptions + route snapshot here
+  // so before_provider_request can apply the 3-step pipeline to the payload.
+  let pendingPromptOptions: BuildSystemPromptOptions | undefined;
+  let pendingRouteSnapshot: PiRouteSnapshot | undefined;
+  let pendingRoutedModel: PiModel | undefined;
   const PERSIST_DEBOUNCE_MS = 2000;
   /** In-memory recent usage samples per model key (not persisted, cleared on reload). */
   const recentSamplesByModelKey = new Map<string, CacheUsageSample[]>();
@@ -5775,7 +5869,7 @@ export default function (pi: ExtensionAPI) {
     // `lastStatusText` early return above.
     if (runtimeOptimizerEnabled && statusText !== undefined && displayModel) {
       // Only show ⚠️ compat when there are safe-fixable missing compat keys.
-      // Optional/advisory-only flags (e.g. supportsLongCacheRetention on generic
+      // Optional/advisory-only flags (e.g. supportsLongPromptCacheRetention on generic
       // OpenAI-compatible proxies) do NOT trigger the marker — the doctor/compat
       // commands still mention them as optional guidance.
       if (buildFixSuggestion(displayModel) !== undefined) {
@@ -5797,9 +5891,18 @@ export default function (pi: ExtensionAPI) {
     await publishStatus(ctx);
   });
 
-  pi.on("model_select", async (event, ctx) => {
-    if (runtimeOptimizerEnabled) notifyCacheCompatIfNeeded(resolveRouteModel(event.model, ctx) ?? event.model, ctx, warnedModels);
-    await publishStatus(ctx, event.model);
+  // OMP divergence: model_select event may not exist in OMP (not listed in
+  // hooks.md/extensions.md). Use turn_start + model-change detection instead.
+  let lastModelKeyForStatus: string | undefined;
+  pi.on("turn_start", async (_event, ctx) => {
+    const model = resolveRouteModel(ctx.model, ctx) ?? ctx.model;
+    const key = model ? modelKey(model) : undefined;
+    if (key === lastModelKeyForStatus) return;
+    lastModelKeyForStatus = key;
+    if (runtimeOptimizerEnabled && model) {
+      notifyCacheCompatIfNeeded(model, ctx, warnedModels);
+    }
+    await publishStatus(ctx, model);
   });
 
   pi.on("before_agent_start", async (event, _ctx) => {
@@ -5809,117 +5912,99 @@ export default function (pi: ExtensionAPI) {
       ? findModelInRegistry(_ctx.modelRegistry, routeSnapshot.provider, routeSnapshot.modelId) ?? routeSnapshotToPiModel(routeSnapshot, _ctx.model)
       : undefined;
 
-    // ────────────────────────────────────────────────────────────────
-    // OpenAI Responses-family bypass (codex-responses + responses + azure responses)
-    //
-    // OpenAI's Responses API endpoints — both the Codex backend
-    // (openai-codex-responses, chatgpt.com) and the public
-    // Responses API (openai-responses, api.openai.com / Copilot) —
-    // have two properties that make client-side prompt reordering
-    // unnecessary and potentially harmful:
-    //
-    //  1. Server-managed caching: both APIs send `prompt_cache_key`
-    //     (= Pi session id) in every request body, so the server
-    //     already maintains a stable cache without prefix ordering.
-    //     Client-side reordering adds no cache benefit.
-    //
-    //  2. Stricter content-safety filtering: the Codex backend in
-    //     particular has a product-level safety filter that flags
-    //     reordered prompts (tool snippets / guidelines lifted above
-    //     the assistant role) as potential prompt-injection, returning
-    //     `content_filter` and blocking tool calls (notably
-    //     `subagent`). The public Responses API shares the same
-    //     filter framework and could behave similarly.
-    //
-    // We therefore skip ALL prompt modifications (churn strip, skill
-    // compression, reorder) for these APIs. Third-party providers
-    // that use openai-completions are unaffected.
-    // ────────────────────────────────────────────────────────────────
+    // OMP divergence: before_agent_start in OMP can only inject messages (return
+    // { message }), NOT mutate systemPrompt. We cache the prompt options + route
+    // snapshot here so before_provider_request can apply the 3-step pipeline to
+    // the provider payload. If OMP does not supply systemPromptOptions, skill
+    // compression and stable-prefix reorder are skipped (only churn strip runs).
+    const eventRecord = asRecord(event);
+    pendingPromptOptions = (eventRecord?.systemPromptOptions as BuildSystemPromptOptions | undefined) ?? undefined;
+    pendingRouteSnapshot = routeSnapshot;
+    pendingRoutedModel = routedModel ?? _ctx.model;
+
     const model = routedModel ?? _ctx.model;
-    if (model && isResponsesPromptRewriteBypassApi(model.api)) {
-      return {};
-    }
-
-    if (!runtimeOptimizerEnabled) return {};
-
-    // Global opt-out: PI_CACHE_OPTIMIZER_NO_PROMPT_REWRITE=1 bypasses all
-    // prompt mutations below (session-overview churn strip, skill compression,
-    // and stable-prefix reordering). Footer stats and the OpenAI
-    // prompt_cache_key fallback remain active.
-    if (isEnabledEnv(process.env[NO_PROMPT_REWRITE_ENV])) {
-      return {};
-    }
-
-    // Step 1: strip per-turn churn from <session-overview>.
-    // Removing RECENT COMMITS, Working directory status, and
-    // Journal line count makes more of the session-overview stable
-    // across turns, which DeepSeek's prefix cache can then retain.
-    const strippedPrompt = stripSessionOverviewChurn(event.systemPrompt);
-
-    // Step 2: compress skills XML → one-line index.
-    // The compressed form is identical-string-equivalent to the
-    // verbose one as far as cache-stability is concerned because both
-    // are deterministic from the same `event.systemPromptOptions.skills`.
-    // No-op if opted out, below SKILL_COMPRESSION_MIN_COUNT, or if pi
-    // emitted a format we don't recognize.
-    const compressedPrompt = compressSkillsInSystemPrompt(
-      strippedPrompt,
-      event.systemPromptOptions,
-    );
-
-    // Step 3: lift stable content above dynamic content for cache
-    // stability. Operates on the (stripped + compressed) prompt so the
-    // cache key derived from `stablePrefix` reflects what actually
-    // ships to the provider.
-    const optimized = optimizeSystemPrompt(compressedPrompt, event.systemPromptOptions);
-
     const promptCacheKey = getSessionPromptCacheKey(_ctx);
     const cacheRetention = process.env[PI_CACHE_RETENTION_ENV] === LONG_CACHE_RETENTION_VALUE ? LONG_CACHE_RETENTION_VALUE : undefined;
-    const publishHint = (systemPrompt: string): void => {
-      latestCacheHint = {
-        sessionIdHash: currentSessionHashSet ? currentSessionHash : sessionHashFromContext(_ctx),
-        virtualProvider: routeSnapshot?.virtualProvider ?? _ctx.model?.provider,
-        virtualModelId: routeSnapshot?.virtualModelId ?? _ctx.model?.id,
-        upstreamProvider: routeSnapshot?.provider ?? model?.provider,
-        upstreamModelId: routeSnapshot?.modelId ?? model?.id,
-        api: model?.api,
-        systemPrompt,
-        promptCacheKey,
-        cacheRetention,
-        timestamp: Date.now(),
-      };
-      const globals = getProtocolGlobal();
-      globals.__piCacheOptimizerCacheKey__ = promptCacheKey;
+    const rawSystemPrompt = typeof eventRecord?.systemPrompt === "string" ? eventRecord.systemPrompt : "";
+    latestCacheHint = {
+      sessionIdHash: currentSessionHashSet ? currentSessionHash : sessionHashFromContext(_ctx),
+      virtualProvider: routeSnapshot?.virtualProvider ?? _ctx.model?.provider,
+      virtualModelId: routeSnapshot?.virtualModelId ?? _ctx.model?.id,
+      upstreamProvider: routeSnapshot?.provider ?? model?.provider,
+      upstreamModelId: routeSnapshot?.modelId ?? model?.id,
+      api: model?.api,
+      systemPrompt: rawSystemPrompt,
+      promptCacheKey,
+      cacheRetention,
+      timestamp: Date.now(),
     };
+    const globals = getProtocolGlobal();
+    globals.__ompCacheOptimizerCacheKey__ = promptCacheKey;
 
-    if (optimized.changed && optimized.systemPrompt.trim().length > 0) {
-      publishHint(optimized.systemPrompt);
-      return { systemPrompt: optimized.systemPrompt };
-    }
-
-    // Reorder didn't apply but compression might have. Return the
-    // compressed (or stripped) prompt directly so we still benefit from
-    // the volume cut even when reorder is a no-op (e.g., short sessions
-    // where no stable candidate is long enough).
-    if (compressedPrompt !== strippedPrompt && compressedPrompt.trim().length > 0) {
-      publishHint(compressedPrompt);
-      return { systemPrompt: compressedPrompt };
-    }
-    if (strippedPrompt !== event.systemPrompt && strippedPrompt.trim().length > 0) {
-      publishHint(strippedPrompt);
-      return { systemPrompt: strippedPrompt };
-    }
-
-    publishHint(event.systemPrompt);
+    // No systemPrompt mutation — OMP before_agent_start returns {} for no-op.
     return {};
   });
 
   pi.on("before_provider_request", (event, ctx) => {
-    if (!shouldInjectOpenAIPromptCacheKey()) return undefined;
     const requestModel = resolveRouteModel(ctx.model, ctx) ?? ctx.model;
-    if (!isOpenAICompatibleApi(requestModel?.api)) return undefined;
+    let mutated = false;
+    let resultPayload = event.payload;
 
-    return addOpenAIPromptCacheKey(event.payload, getSessionPromptCacheKey(ctx));
+    // ── Prompt rewrite (migrated from before_agent_start) ──
+    // OMP divergence: prompt rewriting happens here in the provider payload, not
+    // in before_agent_start. We apply the 3-step pipeline (churn strip → skill
+    // compression → stable-prefix reorder) to the system prompt inside the payload.
+    if (
+      runtimeOptimizerEnabled &&
+      !isEnabledEnv(process.env[NO_PROMPT_REWRITE_ENV]) &&
+      requestModel &&
+      !isResponsesPromptRewriteBypassApi(requestModel.api)
+    ) {
+      const original = extractSystemPrompt(resultPayload);
+      if (original && original.trim().length > 0) {
+        // Step 1: strip per-turn churn from <session-overview>.
+        const stripped = stripSessionOverviewChurn(original);
+
+        // Step 2: compress skills XML → one-line index (requires cached options).
+        const compressed = pendingPromptOptions
+          ? compressSkillsInSystemPrompt(stripped, pendingPromptOptions)
+          : stripped;
+
+        // Step 3: lift stable content above dynamic content (requires cached options).
+        let finalPrompt = compressed;
+        let changed = false;
+        if (pendingPromptOptions) {
+          const optimized = optimizeSystemPrompt(compressed, pendingPromptOptions);
+          if (optimized.changed && optimized.systemPrompt.trim().length > 0) {
+            finalPrompt = optimized.systemPrompt;
+            changed = true;
+          }
+        }
+
+        // Write back if any step changed the prompt.
+        if (changed || finalPrompt !== original) {
+          if (setSystemPrompt(resultPayload, finalPrompt)) {
+            mutated = true;
+            // Update the cache hint with the optimized prompt so router/hints
+            // integrators see the final shipped system prompt.
+            if (latestCacheHint) {
+              latestCacheHint.systemPrompt = finalPrompt;
+            }
+          }
+        }
+      }
+    }
+
+    // ── prompt_cache_key injection (OpenAI-compatible) ──
+    if (shouldInjectOpenAIPromptCacheKey() && isOpenAICompatibleApi(requestModel?.api)) {
+      const withKey = addOpenAIPromptCacheKey(resultPayload, getSessionPromptCacheKey(ctx));
+      if (withKey !== undefined) {
+        resultPayload = withKey;
+        mutated = true;
+      }
+    }
+
+    return mutated ? { payload: resultPayload } : undefined;
   });
 
   pi.on("after_provider_response", (event, ctx) => {
@@ -5934,7 +6019,7 @@ export default function (pi: ExtensionAPI) {
     if (warnedPromptCacheRetention400Models.has(key)) return;
     warnedPromptCacheRetention400Models.add(key);
     ctx.ui.notify(
-      `⚠️ ${LOG_PREFIX}: ${key} returned HTTP 400 while supportsLongCacheRetention is enabled. ` +
+      `⚠️ ${LOG_PREFIX}: ${key} returned HTTP 400 while supportsLongPromptCacheRetention is enabled. ` +
       getPromptCacheRetentionUnsupportedHint() +
       ` Run /cache-optimizer doctor for the exact edit location.`,
       "warning",
@@ -6008,7 +6093,7 @@ export default function (pi: ExtensionAPI) {
   //             with low-hit diagnosis
   //   stats   — show active model stats bucket, recent trend, usage
   //   compat  — show compat suggestion with file path
-  //   fix     — auto-fix compat issues (writes models.json, requires UI)
+  //   fix     — auto-fix compat issues (writes models.yml, requires UI)
   //   reset   — reset current session model stats bucket (local only)
   //   (no args) — interactive menu (with UI) or help summary
   // ────────────────────────────────────────────────────────────────
@@ -6117,145 +6202,24 @@ export default function (pi: ExtensionAPI) {
           return;
         }
 
-        if (!cmdCtx.hasUI) {
-          // No UI — refuse to write, show manual guidance instead.
-          const compatResult = buildCompatDiagnosis(model);
-          if (compatResult) {
-            cmdCtx.ui.notify(
-              `❌ Non-interactive terminal detected. Auto-fix requires UI confirmation.\n\n` +
-              `Manual steps:\n` +
-              `1. Open ${getModelsJsonDisplayPath()} in your editor.\n` +
-              `2. Go to providers["${suggestion.providerLabel}"] -> models -> entry with id "${suggestion.modelId}" -> compat.\n` +
-              `3. Add the missing keys:\n${formatCompatKeysForInsertion(suggestion.compatKeys)}\n` +
-              `4. Save and run /reload.\n\n` +
-              compatResult,
-              "warning",
-            );
-          } else {
-            cmdCtx.ui.notify(
-              `❌ Non-interactive terminal detected. Auto-fix requires UI confirmation.\n` +
-              `Edit ${getModelsJsonDisplayPath()} manually and run /reload.`,
-              "warning",
-            );
-          }
-          return;
-        }
-
-        // Read the models.json file
-        let originalText: string;
-        try {
-          originalText = await readFile(MODELS_JSON_PATH, "utf8");
-        } catch {
-          cmdCtx.ui.notify(`❌ Could not read ${MODELS_JSON_PATH}. File may not exist.`, "error");
-          return;
-        }
-
-        // Locate the model entry
-        const location = locateModelInJsonc(originalText, suggestion.providerLabel, suggestion.modelId);
-        if (!location) {
-          cmdCtx.ui.notify(
-            `❌ Could not locate model "${suggestion.modelId}" in ${getModelsJsonDisplayPath()}.\n` +
-            `The JSONC scanner could not confidently find the target entry.\n` +
-            `Manual edit required: open the file, find providers["${suggestion.providerLabel}"] -> models, and add:\n` +
-            `${formatCompatKeysForInsertion(suggestion.compatKeys)}\n` +
-            `Then run /reload.`,
-            "warning",
-          );
-          return;
-        }
-
-        // Compose the modified text — auto-detect the best placement level:
-        // provider level (channel-wide) when safe for all sibling models, else model level.
-        const decision = chooseFixPlacement(originalText, location, suggestion.compatKeys, suggestion.providerLabel);
-        const modifiedText = composeFixInsertion(originalText, location, suggestion.compatKeys, decision.placement);
-
-        // Self-check
-        const checkError = selfCheckFix(originalText, modifiedText, suggestion.providerLabel, suggestion.modelId, suggestion.compatKeys);
-        if (checkError !== null) {
-          cmdCtx.ui.notify(
-            `❌ Self-check failed before write: ${checkError}\n` +
-            `No changes were made. Manual edit required.`,
-            "error",
-          );
-          return;
-        }
-
-        // Build preview snippet as copyable JSON (the surgical editor will
-        // insert or repair these exact compat key/value pairs).
-        const keysPreview = JSON.stringify(suggestion.compatKeys, null, 2);
-        const targetHasCompat = decision.placement === "provider" ? location.providerCompatBrace >= 0 : location.compatObjectBrace >= 0;
-        const placementDesc = targetHasCompat ? `existing "compat" object` : `new "compat" object`;
-        const locationDesc = decision.placement === "provider"
-          ? `providers["${suggestion.providerLabel}"] -> compat (provider level, ${placementDesc})`
-          : `providers["${suggestion.providerLabel}"] -> models -> "${suggestion.modelId}" -> compat (model level, ${placementDesc})`;
-
-        const ts = backupTimestamp();
-        const backupPath = `${MODELS_JSON_PATH}.backup-cache-optimizer-${ts}`;
-
-        const scopeRiskLine = decision.placement === "provider"
-          ? `  1. This change applies to ALL ${location.allModelIds.length || 1} model(s) in the "${suggestion.providerLabel}" provider, across all sessions.`
-          : `  1. This change affects ALL sessions using the "${suggestion.providerLabel}" provider/channel (scoped to model "${suggestion.modelId}").`;
-
-        const previewLines = [
-          `📝 Preview of changes to ${getModelsJsonDisplayPath()}:`,
-          ``,
-          `Location: ${locationDesc}`,
-          `Placement: ${decision.placement} level — ${decision.reason}`,
-          `Compat JSON to write:`,
-          keysPreview,
-          ``, 
-          `⚠️  Risk notice:`,
-          scopeRiskLine,
-          `  2. A timestamped backup will be written to: ${backupPath}`,
-          `  3. You must restart Pi / run /reload for the change to take effect.`,
-          `  4. If the file contains comments or unusual formatting, please verify the result after write.`,
-          ``, 
-          `Apply these changes?`,
-        ];
-
-        const confirmed = await cmdCtx.ui.confirm("Cache Optimizer — Fix", previewLines.join("\n"));
-        if (!confirmed) {
-          cmdCtx.ui.notify("No changes were made. Canceled by user.", "info");
-          return;
-        }
-
-        // Write: backup → temp + rename → self-check again
-        try {
-          // Backup
-          await copyFile(MODELS_JSON_PATH, backupPath);
-
-          // Atomic write
-          const tempPath = `${MODELS_JSON_PATH}.${process.pid}.${Date.now()}.fix.tmp`;
-          await writeFile(tempPath, modifiedText, "utf8");
-          await rename(tempPath, MODELS_JSON_PATH);
-
-          // Post-write self-check (read back)
-          const writtenText = await readFile(MODELS_JSON_PATH, "utf8");
-          const postCheckError = selfCheckFix(originalText, writtenText, suggestion.providerLabel, suggestion.modelId, suggestion.compatKeys);
-          if (postCheckError !== null) {
-            // Restore from backup
-            await copyFile(backupPath, MODELS_JSON_PATH);
-            cmdCtx.ui.notify(
-              `❌ Post-write self-check failed: ${postCheckError}\n` +
-              `The backup at ${backupPath} has been restored. No changes applied.`,
-              "error",
-            );
-            return;
-          }
-
-          cmdCtx.ui.notify(
-            `✅ Fix applied to ${getModelsJsonDisplayPath()}.\n` +
-            `Backup saved to: ${backupPath}\n` +
-            `Run /reload or restart Pi for the change to take effect.`,
-            "info",
-          );
-        } catch (writeError) {
-          cmdCtx.ui.notify(
-            `❌ Write failed: ${writeError instanceof Error ? writeError.message : String(writeError)}\n` +
-            `Backup may be at: ${backupPath}`,
-            "error",
-          );
-        }
+        // OMP divergence: auto-write YAML surgical editor is not yet implemented.
+        // /cache-optimizer fix shows copyable YAML compat snippet + manual steps.
+        // The JSONC surgical editor (locateModelInJsonc/composeFixInsertion/selfCheckFix)
+        // is preserved as legacy dead code for a future YAML editor PR.
+        const compatResult = buildCompatDiagnosis(model);
+        const yamlSnippet = formatCompatKeysForInsertion(suggestion.compatKeys);
+        cmdCtx.ui.notify(
+          `📝 Manual fix for ${getModelsJsonDisplayPath()}:\n\n` +
+          `Provider: ${suggestion.providerLabel}\n` +
+          `Model: ${suggestion.modelId}\n\n` +
+          `Add these compat keys (model level, under the model entry):\n\n` +
+          `compat:\n${yamlSnippet}\n\n` +
+          `Or at provider level (under providers["${suggestion.providerLabel}"]):\n\n` +
+          `compat:\n${yamlSnippet}\n\n` +
+          `After editing, run /reload.\n` +
+          (compatResult ? `\n${compatResult}` : ""),
+          "info",
+        );
       } else {
         // Try interactive selection menu when UI supports it
         if (cmdCtx.hasUI) {
@@ -6265,7 +6229,7 @@ export default function (pi: ExtensionAPI) {
             "Doctor — Show cache configuration",
             "Stats — Show cache stats and trend",
             "Compat — Show compat suggestion",
-            "Fix — Auto-fix compat issues (writes models.json)",
+            "Fix — Auto-fix compat issues (writes models.yml)",
             "Reset — Reset local session stats",
             "Cancel",
           ];
@@ -6337,94 +6301,19 @@ export default function (pi: ExtensionAPI) {
               return;
             }
 
-            // Read models.json
-            let originalText: string;
-            try {
-              originalText = await readFile(MODELS_JSON_PATH, "utf8");
-            } catch {
-              cmdCtx.ui.notify(`❌ Could not read ${MODELS_JSON_PATH}. File may not exist.`, "error");
-              return;
-            }
-
-            const location = locateModelInJsonc(originalText, suggestion.providerLabel, suggestion.modelId);
-            if (!location) {
-              cmdCtx.ui.notify(
-                `❌ Could not locate model "${suggestion.modelId}" in ${getModelsJsonDisplayPath()}.\n` +
-                `Manual edit required: open the file and add:\n` +
-                `${formatCompatKeysForInsertion(suggestion.compatKeys)}\n` +
-                `Then run /reload.`,
-                "warning",
-              );
-              return;
-            }
-
-            const menuDecision = chooseFixPlacement(originalText, location, suggestion.compatKeys, suggestion.providerLabel);
-            const modifiedText = composeFixInsertion(originalText, location, suggestion.compatKeys, menuDecision.placement);
-            const checkError = selfCheckFix(originalText, modifiedText, suggestion.providerLabel, suggestion.modelId, suggestion.compatKeys);
-            if (checkError !== null) {
-              cmdCtx.ui.notify(`❌ Self-check failed: ${checkError}\nNo changes made.`, "error");
-              return;
-            }
-
-            const keysPreview = JSON.stringify(suggestion.compatKeys, null, 2);
-            const ts = backupTimestamp();
-            const backupPath = `${MODELS_JSON_PATH}.backup-cache-optimizer-${ts}`;
-
-            const menuLocationDesc = menuDecision.placement === "provider"
-              ? `providers["${suggestion.providerLabel}"] -> compat (provider level)`
-              : `providers["${suggestion.providerLabel}"] -> models -> "${suggestion.modelId}" -> compat (model level)`;
-            const menuScopeRiskLine = menuDecision.placement === "provider"
-              ? `  1. This change applies to ALL ${location.allModelIds.length || 1} model(s) in the "${suggestion.providerLabel}" provider, across all sessions.`
-              : `  1. This change affects ALL sessions using the "${suggestion.providerLabel}" provider/channel (scoped to model "${suggestion.modelId}").`;
-
-            const previewLines = [
-              `📝 Preview of changes to ${getModelsJsonDisplayPath()}:`,
-              `Location: ${menuLocationDesc}`,
-              `Placement: ${menuDecision.placement} level — ${menuDecision.reason}`,
-              `Compat JSON to write:`,
-              keysPreview,
-              ``, 
-              `⚠️  Risk notice:`,
-              menuScopeRiskLine,
-              `  2. A timestamped backup will be written to: ${backupPath}`,
-              `  3. You must restart Pi / run /reload for the change to take effect.`,
-              `  4. If the file contains comments, verify the result after write.`,
-              ``, 
-              `Apply these changes?`,
-            ];
-
-            const confirmed = await cmdCtx.ui.confirm("Cache Optimizer — Fix", previewLines.join("\n"));
-            if (!confirmed) {
-              cmdCtx.ui.notify("No changes were made. Canceled by user.", "info");
-              return;
-            }
-
-            try {
-              await copyFile(MODELS_JSON_PATH, backupPath);
-              const tempPath = `${MODELS_JSON_PATH}.${process.pid}.${Date.now()}.fix.tmp`;
-              await writeFile(tempPath, modifiedText, "utf8");
-              await rename(tempPath, MODELS_JSON_PATH);
-
-              const writtenText = await readFile(MODELS_JSON_PATH, "utf8");
-              const postCheck = selfCheckFix(originalText, writtenText, suggestion.providerLabel, suggestion.modelId, suggestion.compatKeys);
-              if (postCheck !== null) {
-                await copyFile(backupPath, MODELS_JSON_PATH);
-                cmdCtx.ui.notify(`❌ Post-write check failed: ${postCheck}\nBackup restored.`, "error");
-                return;
-              }
-
-              cmdCtx.ui.notify(
-                `✅ Fix applied to ${getModelsJsonDisplayPath()}.` +
-                `\nBackup: ${backupPath}` +
-                `\nRun /reload or restart Pi for the change to take effect.`,
-                "info",
-              );
-            } catch (writeError) {
-              cmdCtx.ui.notify(
-                `❌ Write failed: ${writeError instanceof Error ? writeError.message : String(writeError)}`,
-                "error",
-              );
-            }
+            // OMP divergence: auto-write YAML surgical editor not yet implemented.
+            const compatResult = buildCompatDiagnosis(model);
+            const yamlSnippet = formatCompatKeysForInsertion(suggestion.compatKeys);
+            cmdCtx.ui.notify(
+              `📝 Manual fix for ${getModelsJsonDisplayPath()}:\n\n` +
+              `Provider: ${suggestion.providerLabel}\n` +
+              `Model: ${suggestion.modelId}\n\n` +
+              `Add these compat keys:\n\n` +
+              `compat:\n${yamlSnippet}\n\n` +
+              `After editing, run /reload.\n` +
+              (compatResult ? `\n${compatResult}` : ""),
+              "info",
+            );
           } else if (choice === menuOptions[6]) {
             if (!model) {
               cmdCtx.ui.notify("No active model selected. Select a model first with /model or pi --model.", "warning");
@@ -6457,7 +6346,7 @@ export default function (pi: ExtensionAPI) {
         diagnosis.push("  doctor  — Show current model/provider/api/baseUrl/compat and low-hit diagnosis");
         diagnosis.push("  stats   — Show active model stats bucket and recent trend");
         diagnosis.push("  compat  — Show compat suggestion with edit location");
-        diagnosis.push("  fix     — Auto-fix compat issues (writes models.json, requires UI)");
+        diagnosis.push("  fix     — Auto-fix compat issues (writes models.yml, requires UI)");
         diagnosis.push("  reset   — Reset local session stats for current model (does not affect upstream)");
         diagnosis.push("");
         diagnosis.push(formatOptimizerRuntimeMode());
