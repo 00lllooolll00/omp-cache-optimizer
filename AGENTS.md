@@ -11,7 +11,7 @@ OMP Runtime (host, Bun-based)
   │
   ├─ session_start        → restore persisted stats, sync session hash
   ├─ turn_start           → model-change detection, publish footer status
-  │                         (replaces Pi's model_select event)
+  │                         (replaces the original project’s `model_select` event)
   ├─ before_agent_start   → cache systemPromptOptions + route snapshot
   │                         (cannot mutate systemPrompt in OMP — returns {})
   ├─ before_provider_request → 3-step prompt rewrite on payload + inject
@@ -22,7 +22,7 @@ OMP Runtime (host, Bun-based)
 
 - **Single-file monolith**: All logic lives in `index.ts` (~6,500 lines). No `src/` tree.
 - **Extension entry**: `export default function (pi: ExtensionAPI) { … }` — registers hooks + `/cache-optimizer` command.
-- **Prompt rewriting in `before_provider_request`**: OMP divergence from Pi. The 3-step pipeline (churn strip → skill compression → stable-prefix reorder) runs on the provider payload's system prompt field, extracted via `extractSystemPrompt()` / `setSystemPrompt()` which handle `payload.system` (Anthropic), `payload.systemInstruction` (Google), and `payload.messages[0].content` (OpenAI) shapes.
+- **Prompt rewriting in `before_provider_request`**: OMP-specific adaptation. The 3-step pipeline (churn strip → skill compression → stable-prefix reorder) runs on the provider payload's system prompt field, extracted via `extractSystemPrompt()` / `setSystemPrompt()` which handle `payload.system` (Anthropic), `payload.systemInstruction` (Google), and `payload.messages[0].content` (OpenAI) shapes.
 - **Adapter pattern**: `CACHE_PROVIDER_ADAPTERS` array of ~50 adapter objects. Selected by token-matching on model id/name.
 - **Stats persistence**: Session-scoped, versioned JSON at `~/.omp/agent/omp-cache-optimizer-stats.json` (v5 format). Atomic writes via temp + rename. Never persists prompts, payloads, or API keys.
 - **Inter-extension protocol**: Two `Symbol.for` global registries — `omp.routing.registry.v1` (live routing) and `omp.cache.hints.v1` (pre-request hints).
@@ -61,9 +61,9 @@ OMP Runtime (host, Bun-based)
 - Runtime validation via type guards (`isPiRouterAdapterV1()`, `asRecord()`)
 - Env var names keep `PI_CACHE_OPTIMIZER_*` prefix — OMP mirrors `OMP_*` → `PI_*` automatically
 
-### Compat Field Mapping (OMP Divergence from Pi)
+### Compat Field Mapping (Legacy → OMP)
 
-| Pi field | OMP field | Notes |
+|Legacy field|OMP field|Notes|
 |---|---|---|
 | `forceAdaptiveThinking` | *(removed)* | OMP catalog sets `disableAdaptiveThinking` automatically; not user-configurable |
 | `sendSessionAffinityHeaders` | *(removed)* | OMP uses multi-credential auth + session affinity in `agent.db` |
@@ -90,7 +90,7 @@ Integrity guard: WORM-flag `promptTruncationDetected` detects if structural mark
 
 **OMP divergence**: The auto-write YAML surgical editor is not yet implemented. `/cache-optimizer fix` currently shows copyable YAML compat snippets + manual editing instructions. The legacy JSONC surgical editor code (`locateModelInJsonc` / `composeFixInsertion` / `selfCheckFix`) is preserved as dead code for a future YAML editor PR.
 
-The original Pi safety protocol (backup → preview + confirmation → atomic temp+rename → post-write self-check → restore-from-backup on failure) will be reimplemented for YAML in a follow-up.
+The original project's auto-write safety protocol (backup → preview + confirmation → atomic temp+rename → post-write self-check → restore-from-backup on failure) will be reimplemented for YAML in a follow-up.
 
 ### `PI_CACHE_RETENTION` Mechanism
 
@@ -121,7 +121,7 @@ OMP mirrors `OMP_CACHE_OPTIMIZER_*` → `PI_CACHE_OPTIMIZER_*` automatically, so
 - **TypeScript**: `tsc --noEmit` for type-checking; no bundler, no transpiler
 - **Package manager**: npm / Bun (`omp install npm:omp-cache-optimizer`)
 - **Node.js APIs**: `node:crypto` (SHA-256), `node:fs/promises` (atomic file I/O), `node:os` (homedir), `node:path` — all Bun-compatible
-- **Peer dependency**: `@oh-my-pi/pi-coding-agent` (replaces Pi's `@earendil-works/pi-coding-agent`)
+- **Peer dependency**: `@oh-my-pi/pi-coding-agent` (replaces the original project's `@earendil-works/pi-coding-agent` scope)
 - **No external dependencies**: zero npm dependencies beyond the peer package
 
 ## Testing & QA
