@@ -8,7 +8,7 @@
 
 用于提升 OMP 中 provider 侧 KV Cache / Prompt Cache 命中率的扩展：把稳定 prompt 内容前置，给 OpenAI-compatible 请求补保守的 `prompt_cache_key`，提示代理渠道常见缓存路由兼容问题，并在底部显示只读缓存统计。
 
-> 本包从 `pi-cache-optimizer` fork 而来。已有底部统计会自动从 `~/.pi/agent/` 迁移到 `~/.omp/agent/`。正常运行时扩展不会触碰你的 `~/.omp/agent/models.yml`；`/cache-optimizer fix` 当前显示可复制的 YAML compat 片段供手动编辑（自动写入的外科 YAML 编辑器计划在后续版本实现）。
+> 本包从 `pi-cache-optimizer` fork 而来。已有底部统计会自动从旧状态目录 `~/.pi/agent/` 迁移到 `~/.omp/agent/`。正常运行时扩展不会触碰你的 `~/.omp/agent/models.yml`；`/cache-optimizer fix` 当前显示可复制的 YAML compat 片段供手动编辑（自动写入的外科 YAML 编辑器计划在后续版本实现）。
 
 ## 与原项目的关键差异
 
@@ -63,7 +63,7 @@
 omp install npm:omp-cache-optimizer
 ```
 
-如果之前安装过 Pi 版本：
+如果之前安装过原版本：
 
 ```bash
 omp remove npm:pi-cache-optimizer && omp install npm:omp-cache-optimizer
@@ -102,7 +102,7 @@ OMP 0.79.7 及之后，`omp update` 默认只更新 OMP 本体。若要更新已
 
 LiteLLM / OneAPI / NewAPI / 类 OpenRouter 渠道等第三方 `openai-completions` 代理，常会把同一个 session 分散到多个上游后端，导致 provider 侧 prompt cache 被拆散。
 
-**OMP 差异**：OMP 不再使用 `sendSessionAffinityHeaders` compat 字段（Pi 时代的字段），而是通过多凭据 auth + `agent.db` 中的会话亲和性实现上游粘性。长缓存保留改用 `supportsLongPromptCacheRetention` 字段。
+**OMP 差异**：OMP 不再使用 `sendSessionAffinityHeaders` compat 字段（原项目中的旧字段），而是通过多凭据 auth + `agent.db` 中的会话亲和性实现上游粘性。长缓存保留改用 `supportsLongPromptCacheRetention` 字段。
 
 `models.yml` 示例：
 
@@ -129,13 +129,13 @@ providers:
 
 ## Anthropic adaptive thinking 模型
 
-**OMP 差异**：OMP 的内置 model catalog 已为官方 Claude 模型自动设置 adaptive thinking（通过 `disableAdaptiveThinking` 字段，语义与 Pi 的 `forceAdaptiveThinking` 相反），且不可从 `models.yml` 用户配置。因此本扩展对 adaptive thinking 的检测改为信息性提示，不再提供自动修复。
+**OMP 差异**：OMP 的内置 model catalog 已为官方 Claude 模型自动设置 adaptive thinking（通过 `disableAdaptiveThinking` 字段，语义与原项目中的 `forceAdaptiveThinking` 相反），且不可从 `models.yml` 用户配置。因此本扩展对 adaptive thinking 的检测改为信息性提示，不再提供自动修复。
 
 `/cache-optimizer doctor` 和 `/cache-optimizer compat` 会检测 adaptive thinking 模型并显示信息性说明。自定义渠道 fronting Anthropic 时，请确保模型 id 匹配官方发布版本，以便 OMP catalog 正确识别。
 
 ## 使用 `/cache-optimizer fix` 手动修复
 
-**OMP 差异**：当前 `/cache-optimizer fix` 降级为手动建议模式。原 Pi 版本的自动写入安全协议（backup → 预览 + 确认 → 原子 temp+rename → 写入后自检 → 失败回滚）将在后续 PR 中为 YAML 重新实现。
+**OMP 差异**：当前 `/cache-optimizer fix` 降级为手动建议模式。原项目中的自动写入安全协议（backup → 预览 + 确认 → 原子 temp+rename → 写入后自检 → 失败回滚）将在后续 PR 中为 YAML 重新实现。
 
 当前行为：
 
@@ -274,7 +274,7 @@ registry?.registerRouter({
 });
 ```
 
-cache hints 协议（`Symbol.for("omp.cache.hints.v1")`）形状与 Pi 版本一致，用于预响应阶段透传优化后的 system prompt / prompt cache key / cache retention hint。
+cache hints 协议（`Symbol.for("omp.cache.hints.v1")`）形状与原项目一致，用于预响应阶段透传优化后的 system prompt / prompt cache key / cache retention hint。
 
 ## 卸载
 

@@ -64,7 +64,7 @@ const LOG_PREFIX = "omp-cache-optimizer";
 const STATUS_KEY = "omp-cache-stats";
 const STATE_DIR = join(homedir(), ".omp", "agent");
 const STATE_FILE_PATH = join(STATE_DIR, "omp-cache-optimizer-stats.json");
-// Legacy Pi-era state file path: read for one-way migration only, never written.
+// Legacy source-project state file path: read for one-way migration only, never written.
 const LEGACY_PI_STATE_FILE_PATH = join(homedir(), ".pi", "agent", "pi-cache-optimizer-stats.json");
 const LEGACY_STATE_FILE_PATH = join(STATE_DIR, "deepseek-cache-optimizer-stats.json");
 const CACHE_PROVIDER_IDS: CacheProviderId[] = ["deepseek", "openai", "claude", "gemini"];
@@ -77,7 +77,7 @@ const OPENAI_PROMPT_CACHE_KEY_MAX_LENGTH = 64;
 const NO_SKILL_COMPRESSION_ENV = "PI_CACHE_OPTIMIZER_NO_SKILL_COMPRESSION";
 const NO_PROMPT_REWRITE_ENV = "PI_CACHE_OPTIMIZER_NO_PROMPT_REWRITE";
 // Inter-extension protocol symbols are versioned under the omp.* namespace. The v1
-// shape is identical to the legacy pi.* symbols; router/hints integrators on OMP
+// shape is identical to the legacy symbols; router/hints integrators on OMP
 // should register under omp.routing.registry.v1 / omp.cache.hints.v1.
 const PI_ROUTING_REGISTRY_SYMBOL = Symbol.for("omp.routing.registry.v1");
 const PI_CACHE_HINTS_SYMBOL = Symbol.for("omp.cache.hints.v1");
@@ -104,7 +104,7 @@ function getLastPromptIntegrityWarningAt(): number {
 }
 
 // Minimum count of skills before compression is worth applying.
-// Below this, pi's verbose XML block is small enough that the overhead of
+// Below this, the runtime's verbose XML block is small enough that the overhead of
 // an additional one-line index isn't worth the loss of per-skill
 // description hints. The 31-skill snapshot in this repo was 13.3 KB; one
 // or two skills is well under 1 KB and not worth touching.
@@ -122,7 +122,7 @@ const SKILL_COMPRESSION_MIN_COUNT = 4;
 // The threshold also caps the upstream string-vs-array regression we saw with
 // trellis 0.5.16 / 0.6.0-beta.17 (subagent tool registration passing
 // `promptGuidelines: "<long string>"` instead of `["<long string>"]`, which
-// pi then iterates char-by-char). Even if a similar bug recurs upstream, this
+// the runtime then iterates char-by-char). Even if a similar bug recurs upstream, this
 // extension will not lift its single-character byproducts into the stable
 // prefix candidate list.
 //
@@ -268,7 +268,7 @@ type PersistedCacheStatsV3 = {
 
 /**
  * V4 format: session-scoped stats buckets.
- * Each Pi process/session gets its own stats isolated by a hashed session id.
+ * Each session in the host runtime gets its own stats isolated by a hashed session id.
  *
  * sessions: sessionHash → modelKey (provider/id) → CacheStats
  * legacyFamily: unchanged from v3 (migration/fallback when ctx.model is unknown)
@@ -375,7 +375,7 @@ function formatSkillsForPrompt(skills: NonNullable<BuildSystemPromptOptions["ski
 /**
  * Compressed alternative to `formatSkillsForPrompt`.
  *
- * Pi emits a four-line XML block per skill (`<name>`, `<description>`,
+ * The host runtime emits a four-line XML block per skill (`<name>`, `<description>`,
  * `<location>`) plus a three-sentence preamble. With 31 skills active in
  * this repo that block measured 13.3 KB — 61.5 % of the total system
  * prompt. The full description text matters when the model has to decide
@@ -454,7 +454,7 @@ function formatSkillsForPromptCompressed(
 }
 
 /**
- * Replace pi's verbose `<available_skills>` block in `prompt` with the
+ * Replace the runtime's verbose `<available_skills>` block in `prompt` with the
  * compressed one-index form. Idempotent: if the verbose form is not
  * present (compression already applied, or skill count below threshold),
  * the prompt is returned unchanged.
@@ -465,7 +465,7 @@ function formatSkillsForPromptCompressed(
  *   - opts.skills present and visible-skill count >= SKILL_COMPRESSION_MIN_COUNT
  *   - Verbose block (built from the same `opts.skills`) is found in
  *     `prompt` (substring match, no regex). This anchors the substitution
- *     to pi's own emitter; if pi changes the format, we no-op rather
+ *     to the runtime's own emitter; if the format changes, we no-op rather
  *     than mangle.
  */
 function compressSkillsInSystemPrompt(
@@ -589,14 +589,14 @@ function stripSessionOverviewChurn(prompt: string): string {
  * prompt rather than ship a corrupted one.
  *
  * Three marker categories are recognized (covers ~99% of real-world
- * extension injection patterns in the pi ecosystem):
+ * extension injection patterns in the host runtime ecosystem):
  *
  *   1. XML-style opening tags  `<tagname>` (lowercase, alpha-num + `_`/`-`)
  *   2. XML-style closing tags  `</tagname>`
  *   3. HTML comment START/END  `<!-- NAME:START -->` / `<!-- NAME:END -->`
  *
  * Tags with attributes (e.g., `<task id="42">`) are not currently emitted
- * by any pi extension we know of and are skipped to keep the regex tight.
+ * by any runtime extension we know of and are skipped to keep the regex tight.
  * Markdown headers, horizontal rules, and timestamp patterns are not
  * usable as guards because they have no closing form to verify.
  *
@@ -676,7 +676,7 @@ function optimizeSystemPrompt(
   // protected without code changes when new extensions ship.
   //
   // Our skills compression runs BEFORE optimizeSystemPrompt and replaces
-  // pi's verbose `<available_skills>` block with a compressed text
+  // the runtime's verbose `<available_skills>` block with a compressed text
   // section that has no XML tag. So `original` here (post-compression)
   // does not contain `<available_skills>` and the result doesn't either
   // — no false positive.
@@ -969,12 +969,13 @@ function getNonNegativeNumber(record: UnknownRecord, key: string): number | unde
 function getCompat(model: PiModel | undefined): CacheCompat {
   if (!model) return {} as CacheCompat;
   
-  // Pi merges provider.compat with model.compat (model wins on conflicts)
-  // We approximate this by reading from ctx.model which should already have merged compat
-  // However, for safety, we check both levels if available
+  // The host runtime merges provider.compat with model.compat (model wins on conflicts).
+  // We approximate this by reading from ctx.model which should already have merged compat.
+  // However, for safety, we check both levels if available.
   const modelCompat = (model.compat ?? {}) as CacheCompat;
-  
-  // Note: ctx.model from Pi should already contain merged compat,
+
+  // Note: ctx.model from the host runtime should already contain merged compat,
+  // but we document the two-level structure for clarity.
   // but we document the two-level structure for clarity
   return modelCompat;
 }
@@ -1141,7 +1142,7 @@ function isGeminiLikeAssistantMessage(message: unknown, model: PiModel | undefin
  * Check whether the model id uses Anthropic's adaptive generation (thinking)
  * that requires `forceAdaptiveThinking: true` in compat.
  *
- * Adaptive-generation models (from pi-ai built-in catalog) include:
+ * Adaptive-generation models (from the bundled model catalog) include:
  *   claude-opus-4-6, claude-opus-4-7, claude-opus-4-8 (also dotted 4.6/4.7/4.8)
  *   claude-sonnet-4-6
  *   claude-fable-5
@@ -1162,7 +1163,7 @@ function isAdaptiveGenerationModel(model: PiModel | undefined): boolean {
 // OMP divergence: adaptive thinking is set automatically by the OMP built-in model
 // catalog (via disableAdaptiveThinking, with reversed semantics) and is NOT
 // user-configurable from models.yml (see omp models.md §Anthropic compatibility).
-// The Pi-era forceAdaptiveThinking flag no longer exists. We keep model detection
+// The legacy `forceAdaptiveThinking` flag no longer exists. We keep model detection
 // (isAdaptiveGenerationModel) for informational doctor output, but drop the fixable
 // compat-suggestion path entirely.
 function isAdaptiveThinkingCompatApplicable(_model: PiModel): boolean {
@@ -1734,14 +1735,14 @@ function readCacheWriteFromDetails(details: UnknownRecord | undefined): number |
   return getFirstNonNegativeNumber(details?.cache_write_tokens, details?.cacheWriteTokens);
 }
 
-// Pi normalizes provider-specific raw usage (prompt_cache_hit_tokens, cached_tokens,
+// The host runtime normalizes provider-specific raw usage (prompt_cache_hit_tokens, cached_tokens,
 // cache_read_input_tokens, etc.) into a common shape:
 //   input     = uncached prompt portion (total prompt minus cacheRead minus cacheWrite)
 //   cacheRead = tokens read from a previously-cached prefix
 //   cacheWrite= tokens newly written into cache in this request
 //
 // We reconstruct the total prompt-token count as input + cacheRead + cacheWrite.
-// Pi guarantees that input, cacheRead, and cacheWrite are always present on
+// The host runtime guarantees that input, cacheRead, and cacheWrite are always present on
 // assistant messages processed through its provider pipeline (at least as zero).
 //
 // Only DeepSeek sets allowInputOnly=true so that a cache miss (cacheRead=0) still
@@ -1757,10 +1758,10 @@ function getPiNormalizedUsage(message: unknown, allowInputOnly = false): UsageSn
 
   if (!hasCacheSignal && (input === undefined || !allowInputOnly)) return undefined;
 
-  // Under healthy Pi normalization input is the uncached portion, so
+  // Under healthy runtime normalization input is the uncached portion, so
   // totalInput = input + cacheRead + cacheWrite gives the full prompt token count.
   // Guard against degenerate reads where a broken proxy omits prompt_tokens and
-  // Pi's input falls to zero: totalInput must never be less than cacheRead + cacheWrite.
+  // normalized input falls to zero: totalInput must never be less than cacheRead + cacheWrite.
   const computed = (input ?? 0) + (cacheRead ?? 0) + (cacheWrite ?? 0);
   const floor = (cacheRead ?? 0) + (cacheWrite ?? 0);
   return {
@@ -1771,8 +1772,8 @@ function getPiNormalizedUsage(message: unknown, allowInputOnly = false): UsageSn
 }
 
 // Raw fallback for DeepSeek responses that still carry their native usage fields.
-// In practice Pi normalizes usage before message_end fires, so this path is only
-// reached when Pi-normalized fields are absent (e.g. custom/foreign providers).
+// In practice the runtime normalizes usage before message_end fires, so this path is only
+// reached when normalized fields are absent (e.g. custom/foreign providers).
 function getDeepSeekRawUsage(message: unknown): UsageSnapshot | undefined {
   const usage = usageRecordFromAssistant(message);
   if (!usage) return undefined;
@@ -1789,8 +1790,8 @@ function getDeepSeekRawUsage(message: unknown): UsageSnapshot | undefined {
 }
 
 // Raw fallback for OpenAI-family responses that still carry their native usage fields.
-// In practice Pi normalizes usage before message_end fires, so this path is only
-// reached when Pi-normalized fields are absent (e.g. custom/foreign providers).
+// In practice the runtime normalizes usage before message_end fires, so this path is only
+// reached when normalized fields are absent (e.g. custom/foreign providers).
 function getOpenAIRawUsage(message: unknown): UsageSnapshot | undefined {
   const usage = usageRecordFromAssistant(message);
   if (!usage) return undefined;
@@ -1812,8 +1813,8 @@ function getOpenAIRawUsage(message: unknown): UsageSnapshot | undefined {
 }
 
 // Raw fallback for Anthropic/Claude responses that still carry their native usage fields.
-// In practice Pi normalizes usage before message_end fires, so this path is only
-// reached when Pi-normalized fields are absent (e.g. custom/foreign providers).
+// In practice the runtime normalizes usage before message_end fires, so this path is only
+// reached when normalized fields are absent (e.g. custom/foreign providers).
 function getAnthropicRawUsage(message: unknown): UsageSnapshot | undefined {
   const usage = usageRecordFromAssistant(message);
   if (!usage) return undefined;
@@ -1832,8 +1833,8 @@ function getAnthropicRawUsage(message: unknown): UsageSnapshot | undefined {
 }
 
 // Raw fallback for Gemini/Vertex responses that still carry their native usage fields.
-// In practice Pi normalizes usage before message_end fires, so this path is only
-// reached when Pi-normalized fields are absent (e.g. custom/foreign providers).
+// In practice the runtime normalizes usage before message_end fires, so this path is only
+// reached when normalized fields are absent (e.g. custom/foreign providers).
 function getGeminiRawUsage(message: unknown): UsageSnapshot | undefined {
   const record = getAssistantRecord(message);
   if (!record) return undefined;
@@ -1867,8 +1868,8 @@ function getGeminiRawUsage(message: unknown): UsageSnapshot | undefined {
   return { cacheRead, cacheWrite: 0, totalInput };
 }
 
-// Try Pi-normalized usage first (always present for messages that went through Pi's
-// provider pipeline). Fall back to provider-specific raw-field readers when Pi-normalized
+// Try normalized usage first (always present for messages that went through the runtime's
+// provider pipeline). Fall back to provider-specific raw-field readers when normalized
 // fields are absent (e.g. messages from custom/foreign providers whose raw usage shape
 // matches the official API).
 function normalizeWithFallback(
@@ -2038,7 +2039,7 @@ function isOfficialOpenAIBaseUrl(model: PiModel): boolean {
 }
 
 function describeMissingOpenAIFamilyProxyCompat(_model: PiModel): string[] {
-  // OMP divergence: Pi's sendSessionAffinityHeaders has no compat equivalent.
+  // OMP divergence: the legacy `sendSessionAffinityHeaders` flag has no compat equivalent.
   // OMP achieves upstream stickiness via multi-credential auth + session affinity
   // in agent.db (see omp models.md §Auth). There is no required compat key for
   // OpenAI-family proxies on OMP, so this returns an empty list. Optional long
@@ -2332,7 +2333,7 @@ const CACHE_PROVIDER_ADAPTERS: CacheProviderAdapter[] = [
 
       return (
         `💡 Cache optimizer: ${modelKey(model)} looks Claude/Anthropic-like but OpenAI-compatible compat lacks cacheControlFormat: "anthropic". ` +
-        "Pi may not place Anthropic cache_control breakpoints unless this endpoint supports and enables that compat flag."
+        "OMP may not place Anthropic cache_control breakpoints unless this endpoint supports and enables that compat flag."
       );
     },
   },
@@ -3363,7 +3364,7 @@ function formatTokenM(value: number): string {
 
 /**
  * Check if an assistant message's usage fields appear to be missing or empty.
- * Returns true when Pi-normalized fields (input, cacheRead, cacheWrite) are all
+ * Returns true when normalized fields (input, cacheRead, cacheWrite) are all
  * absent/zero AND raw usage fields (prompt_tokens, etc.) are also absent/zero
  * for the given adapter.
  */
@@ -3371,12 +3372,12 @@ function hasMissingUsageFields(message: unknown, adapter: CacheProviderAdapter):
   const usage = usageRecordFromAssistant(message);
   if (!usage) return true;
 
-  // Check Pi-normalized fields
+  // Check normalized fields
   const input = getNonNegativeNumber(usage, "input");
   const cacheRead = getNonNegativeNumber(usage, "cacheRead");
   const cacheWrite = getNonNegativeNumber(usage, "cacheWrite");
 
-  // If Pi-normalized fields exist with non-zero values, usage is present
+  // If normalized fields exist with non-zero values, usage is present
   if (cacheRead !== undefined || cacheWrite !== undefined || (input !== undefined && input > 0)) {
     return false;
   }
@@ -4052,7 +4053,7 @@ function getCompatCheckNotApplicableLines(model: PiModel): string[] {
   if (api === "openai-codex-responses" || (api === "openai-responses" && isOfficialOpenAIBaseUrl(model))) {
     return [
       "ℹ️ Compat check not applicable for this model.",
-      "   Native Responses transports already use Pi core request handling; OpenAI-compatible proxy compat flags do not apply.",
+      "   Native Responses transports already use core runtime request handling; OpenAI-compatible proxy compat flags do not apply.",
     ];
   }
 
@@ -4934,9 +4935,9 @@ function chooseFixPlacement(
     Object.keys(compatKeys),
   );
 
-  // Provider-level writes cannot override a model-level compat key because Pi's
+  // Provider-level writes cannot override a model-level compat key because the runtime's
   // merge order is provider.compat then model.compat. If the active model already
-  // has one of the keys we need to repair (e.g. thinkingFormat: "legacy"), write
+  // has one of the keys we need to repair (e.g. thinkingFormat: \"legacy\"), write
   // at model level even when the key would otherwise be provider-safe.
   if (decision.placement === "provider" && existingModelKeys.length > 0) {
     return {
@@ -5103,7 +5104,7 @@ function selfCheckFix(
     }
     
     // Step 5: Compute the EFFECTIVE merged compat (provider-level + model-level),
-    // mirroring Pi's mergeCompat behavior (model wins on conflicts). The fix may
+    // mirroring the runtime's mergeCompat behavior (model wins on conflicts). The fix may
     // have written either level, so validation must check the merged result.
     const provCompatRaw = (provider as Record<string, unknown>).compat;
     const provCompat = (provCompatRaw && typeof provCompatRaw === 'object' && !Array.isArray(provCompatRaw))
@@ -5226,7 +5227,7 @@ function backupTimestamp(): string {
 
 // Internal helpers exported only so the task verification script
 // (.trellis/tasks/.../verify.ts) can exercise them. They are not part of the
-// extension's public API; pi only invokes the default export below.
+// extension's public API; the host runtime only invokes the default export below.
 export const __internals_for_tests = {
   buildStableCandidates,
   optimizeSystemPrompt,
@@ -5709,7 +5710,7 @@ export default function (pi: ExtensionAPI) {
 
     if (reason === "reload") {
       // /reload: preserve session-scoped stats (same session hash).
-      // Pi extension reload creates a fresh closure, so cacheStatsByModel
+      // OMP extension reload creates a fresh closure, so cacheStatsByModel
       // starts empty. Read persisted data and filter for current session.
       lastStatusText = undefined;
       lastPromptIntegrityWarningAt = 0;
@@ -6098,7 +6099,7 @@ export default function (pi: ExtensionAPI) {
   //   (no args) — interactive menu (with UI) or help summary
   // ────────────────────────────────────────────────────────────────
   pi.registerCommand("cache-optimizer", {
-    description: "Diagnose Pi cache configuration",
+    description: "Diagnose OMP cache configuration",
     handler: async (args: string, cmdCtx) => {
       syncSessionHash(cmdCtx);
       const selectedModel = cmdCtx.model;
@@ -6110,16 +6111,16 @@ export default function (pi: ExtensionAPI) {
         resetCurrentSessionStats();
         await flushPersistCacheStats(cmdCtx as unknown as ExtensionContext);
         await publishStatus(cmdCtx as unknown as ExtensionContext, model);
-        cmdCtx.ui.notify(`✅ Pi Cache Optimizer enabled for this Pi process. Current-session stats were reset for before/after comparison.\n${formatOptimizerRuntimeMode()}`, "info");
+        cmdCtx.ui.notify(`✅ OMP Cache Optimizer enabled for this OMP process. Current-session stats were reset for before/after comparison.\n${formatOptimizerRuntimeMode()}`, "info");
       } else if (subcommand === "disable") {
         setRuntimeOptimizerEnabled(false);
         resetCurrentSessionStats();
         await flushPersistCacheStats(cmdCtx as unknown as ExtensionContext);
         await publishStatus(cmdCtx as unknown as ExtensionContext, model);
-        cmdCtx.ui.notify(`⏸️ Pi Cache Optimizer disabled for this Pi process. Current-session stats were reset and will keep collecting while disabled for comparison.\n${formatOptimizerRuntimeMode()}`, "warning");
+        cmdCtx.ui.notify(`⏸️ OMP Cache Optimizer disabled for this OMP process. Current-session stats were reset and will keep collecting while disabled for comparison.\n${formatOptimizerRuntimeMode()}`, "warning");
       } else if (subcommand === "doctor") {
         if (!model) {
-          cmdCtx.ui.notify("No active model selected. Select a model first with /model or pi --model.", "warning");
+          cmdCtx.ui.notify("No active model selected. Select a model first with /model or omp --model.", "warning");
           return;
         }
         const diagnosis = buildDoctorDiagnosis(model, { promptCacheRetention400: promptCacheRetention400Models.has(modelKey(model)) });
@@ -6134,7 +6135,7 @@ export default function (pi: ExtensionAPI) {
         cmdCtx.ui.notify(fullDiagnosis, "info");
       } else if (subcommand === "stats") {
         if (!model) {
-          cmdCtx.ui.notify("No active model selected. Select a model first with /model or pi --model.", "warning");
+          cmdCtx.ui.notify("No active model selected. Select a model first with /model or omp --model.", "warning");
           return;
         }
         const adapter = selectAdapterForModel(model);
@@ -6145,7 +6146,7 @@ export default function (pi: ExtensionAPI) {
         cmdCtx.ui.notify(output, "info");
       } else if (subcommand === "compat") {
         if (!model) {
-          cmdCtx.ui.notify("No active model selected. Select a model first with /model or pi --model.", "warning");
+          cmdCtx.ui.notify("No active model selected. Select a model first with /model or omp --model.", "warning");
           return;
         }
         const compatResult = buildCompatDiagnosis(model);
@@ -6161,7 +6162,7 @@ export default function (pi: ExtensionAPI) {
         }
       } else if (subcommand === "reset") {
         if (!model) {
-          cmdCtx.ui.notify("No active model selected. Select a model first with /model or pi --model.", "warning");
+          cmdCtx.ui.notify("No active model selected. Select a model first with /model or omp --model.", "warning");
           return;
         }
         const adapter = selectAdapterForModel(model);
@@ -6186,12 +6187,12 @@ export default function (pi: ExtensionAPI) {
         cmdCtx.ui.notify(
           `✅ Reset local session cache stats for "${displayKey}". ` +
           "Upstream provider prompt cache was not modified. " +
-          "New requests will start a fresh stats bucket for this Pi session.",
+          "New requests will start a fresh stats bucket for this OMP session.",
           "info",
         );
       } else if (subcommand === "fix") {
         if (!model) {
-          cmdCtx.ui.notify("No active model selected. Select a model first with /model or pi --model.", "warning");
+          cmdCtx.ui.notify("No active model selected. Select a model first with /model or omp --model.", "warning");
           return;
         }
 
@@ -6239,16 +6240,16 @@ export default function (pi: ExtensionAPI) {
             resetCurrentSessionStats();
             await flushPersistCacheStats(cmdCtx as unknown as ExtensionContext);
             await publishStatus(cmdCtx as unknown as ExtensionContext, model);
-            cmdCtx.ui.notify(`✅ Pi Cache Optimizer enabled for this Pi process. Current-session stats were reset for before/after comparison.\n${formatOptimizerRuntimeMode()}`, "info");
+            cmdCtx.ui.notify(`✅ OMP Cache Optimizer enabled for this OMP process. Current-session stats were reset for before/after comparison.\n${formatOptimizerRuntimeMode()}`, "info");
           } else if (choice === menuOptions[1]) {
             setRuntimeOptimizerEnabled(false);
             resetCurrentSessionStats();
             await flushPersistCacheStats(cmdCtx as unknown as ExtensionContext);
             await publishStatus(cmdCtx as unknown as ExtensionContext, model);
-            cmdCtx.ui.notify(`⏸️ Pi Cache Optimizer disabled for this Pi process. Current-session stats were reset and will keep collecting while disabled for comparison.\n${formatOptimizerRuntimeMode()}`, "warning");
+            cmdCtx.ui.notify(`⏸️ OMP Cache Optimizer disabled for this OMP process. Current-session stats were reset and will keep collecting while disabled for comparison.\n${formatOptimizerRuntimeMode()}`, "warning");
           } else if (choice === menuOptions[2]) {
             if (!model) {
-              cmdCtx.ui.notify("No active model selected. Select a model first with /model or pi --model.", "warning");
+              cmdCtx.ui.notify("No active model selected. Select a model first with /model or omp --model.", "warning");
             } else {
               const diagnosis = buildDoctorDiagnosis(model, { promptCacheRetention400: promptCacheRetention400Models.has(modelKey(model)) });
               const adapter = selectAdapterForModel(model);
@@ -6263,7 +6264,7 @@ export default function (pi: ExtensionAPI) {
             }
           } else if (choice === menuOptions[3]) {
             if (!model) {
-              cmdCtx.ui.notify("No active model selected. Select a model first with /model or pi --model.", "warning");
+              cmdCtx.ui.notify("No active model selected. Select a model first with /model or omp --model.", "warning");
             } else {
               const adapter = selectAdapterForModel(model);
               const sk = model ? sessionModelKey(model) : undefined;
@@ -6274,7 +6275,7 @@ export default function (pi: ExtensionAPI) {
             }
           } else if (choice === menuOptions[4]) {
             if (!model) {
-              cmdCtx.ui.notify("No active model selected. Select a model first with /model or pi --model.", "warning");
+              cmdCtx.ui.notify("No active model selected. Select a model first with /model or omp --model.", "warning");
             } else {
               const compatResult = buildCompatDiagnosis(model);
               if (compatResult) {
@@ -6291,7 +6292,7 @@ export default function (pi: ExtensionAPI) {
           } else if (choice === menuOptions[5]) {
             // Fix — auto-fix compat issues
             if (!model) {
-              cmdCtx.ui.notify("No active model selected. Select a model first with /model or pi --model.", "warning");
+              cmdCtx.ui.notify("No active model selected. Select a model first with /model or omp --model.", "warning");
               return;
             }
             const suggestion = buildFixSuggestion(model);
@@ -6316,7 +6317,7 @@ export default function (pi: ExtensionAPI) {
             );
           } else if (choice === menuOptions[6]) {
             if (!model) {
-              cmdCtx.ui.notify("No active model selected. Select a model first with /model or pi --model.", "warning");
+              cmdCtx.ui.notify("No active model selected. Select a model first with /model or omp --model.", "warning");
             } else {
               const adapter = selectAdapterForModel(model);
               if (!adapter) {
@@ -6341,8 +6342,8 @@ export default function (pi: ExtensionAPI) {
         // Fallback: text help when no interactive UI
         const diagnosis: string[] = [];
         diagnosis.push("📋 /cache-optimizer commands:");
-        diagnosis.push("  enable  — Enable prompt/cache optimizations for this Pi process");
-        diagnosis.push("  disable — Disable prompt/cache optimizations for this Pi process");
+        diagnosis.push("  enable  — Enable prompt/cache optimizations for this OMP process");
+        diagnosis.push("  disable — Disable prompt/cache optimizations for this OMP process");
         diagnosis.push("  doctor  — Show current model/provider/api/baseUrl/compat and low-hit diagnosis");
         diagnosis.push("  stats   — Show active model stats bucket and recent trend");
         diagnosis.push("  compat  — Show compat suggestion with edit location");
