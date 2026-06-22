@@ -60,13 +60,13 @@
 ## 安装
 
 ```bash
-omp install npm:omp-cache-optimizer
+omp plugin install omp-cache-optimizer
 ```
 
 如果之前安装过原版本：
 
 ```bash
-omp remove npm:pi-cache-optimizer && omp install npm:omp-cache-optimizer
+omp plugin uninstall pi-cache-optimizer && omp plugin install omp-cache-optimizer
 ```
 
 安装、更新或移除后，在 OMP 中运行 `/reload`，让 extension hooks 刷新。
@@ -291,7 +291,7 @@ cache hints 协议（`Symbol.for("omp.cache.hints.v1")`）形状与原项目一�
 ## 卸载
 
 ```bash
-omp remove npm:omp-cache-optimizer
+omp plugin uninstall omp-cache-optimizer
 ```
 
 卸载后运行 `/reload`。本地统计文件 `~/.omp/agent/omp-cache-optimizer-stats.json` 不会自动删除，可手动清理。
