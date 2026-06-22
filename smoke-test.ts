@@ -203,6 +203,11 @@ expect(
   formatted.includes("40%") === true,
   `应包含 40% 百分比，实际: "${formatted}"`,
 );
+expect(
+  "formatCacheStats.uses-cache-word",
+  formatted.includes("Cache 1/2") === true,
+  `应包含 Cache 1/2，实际: "${formatted}"`,
+)
 
 // ── 4. extractSystemPrompt / setSystemPrompt ─────────────────────
 
