@@ -27,6 +27,7 @@ const {
   extractSystemPrompt,
   setSystemPrompt,
   asRecord,
+  addOpenAIPromptCacheKey,
 } = __internals_for_tests;
 
 let passed = 0;
@@ -413,6 +414,22 @@ expect(
   "extractSystemPrompt.none-returns-undefined",
   extractSystemPrompt(noSystemPayload) === undefined,
   "无 system prompt 应返回 undefined",
+);
+
+// ── 5. OpenAI prompt_cache_key 注入 ─────────────────────────────
+
+const cacheKeyPayload: Record<string, unknown> = { messages: [{ role: "user", content: "hello" }] };
+const cacheKeyResult = addOpenAIPromptCacheKey(cacheKeyPayload, "session-cache-key");
+expect(
+  "addOpenAIPromptCacheKey.mutates-in-place",
+  cacheKeyResult === cacheKeyPayload && cacheKeyPayload.prompt_cache_key === "session-cache-key",
+  `应原地写入 prompt_cache_key，实际: ${JSON.stringify(cacheKeyPayload)}`,
+);
+const existingCacheKeyPayload: Record<string, unknown> = { prompt_cache_key: "existing" };
+expect(
+  "addOpenAIPromptCacheKey.keeps-existing-key",
+  addOpenAIPromptCacheKey(existingCacheKeyPayload, "next") === undefined && existingCacheKeyPayload.prompt_cache_key === "existing",
+  `已有 prompt_cache_key 不应被覆盖，实际: ${JSON.stringify(existingCacheKeyPayload)}`,
 );
 
 // ── 5. asRecord 类型守卫 ─────────────────────────────────────────
