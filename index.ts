@@ -312,6 +312,15 @@ type CacheUsageSample = {
   missingUsageFields: boolean;
 };
 
+type PromptRewriteContext = {
+  options?: BuildSystemPromptOptions;
+  routeSnapshot?: PiRouteSnapshot;
+  routedModel?: PiModel;
+  timestamp: number;
+};
+
+const PROMPT_REWRITE_CONTEXT_TTL_MS = 10_000;
+
 /** Maximum number of recent samples kept per model key (in-memory only, not persisted). */
 const MAX_RECENT_SAMPLES = 50;
 
@@ -968,16 +977,42 @@ function getNonNegativeNumber(record: UnknownRecord, key: string): number | unde
  */
 function getCompat(model: PiModel | undefined): CacheCompat {
   if (!model) return {} as CacheCompat;
-  
-  // The host runtime merges provider.compat with model.compat (model wins on conflicts).
-  // We approximate this by reading from ctx.model which should already have merged compat.
-  // However, for safety, we check both levels if available.
-  const modelCompat = (model.compat ?? {}) as CacheCompat;
 
-  // Note: ctx.model from the host runtime should already contain merged compat,
-  // but we document the two-level structure for clarity.
-  // but we document the two-level structure for clarity
-  return modelCompat;
+  const record = model as PiModel & { compatConfig?: Record<string, unknown> };
+  return {
+    ...((record.compatConfig ?? {}) as CacheCompat),
+    ...((record.compat ?? {}) as CacheCompat),
+  };
+}
+
+function makePromptRewriteContextKey(sessionHash: string | undefined, model: PiModel | undefined): string | undefined {
+  if (!sessionHash || !model) return undefined;
+  return `${sessionHash}:${modelKey(model)}`;
+}
+
+function rememberPromptRewriteContext(
+  contexts: Map<string, PromptRewriteContext>,
+  key: string | undefined,
+  context: PromptRewriteContext,
+): void {
+  if (!key) return;
+  contexts.set(key, context);
+}
+
+function getPromptRewriteContext(
+  contexts: Map<string, PromptRewriteContext>,
+  key: string | undefined,
+  now = Date.now(),
+  ttlMs = PROMPT_REWRITE_CONTEXT_TTL_MS,
+): PromptRewriteContext | undefined {
+  if (!key) return undefined;
+  const context = contexts.get(key);
+  if (!context) return undefined;
+  if (now - context.timestamp > ttlMs) {
+    contexts.delete(key);
+    return undefined;
+  }
+  return context;
 }
 
 /**
@@ -1033,18 +1068,18 @@ function isRuntimeOptimizerEnabled(): boolean {
 }
 
 function getOptimizerRuntimeModeLines(): string[] {
-  const state = runtimeOptimizerEnabled ? "enabled" : "disabled";
+  const state = runtimeOptimizerEnabled ? "已启用" : "已关闭";
   const lines: string[] = [];
-  lines.push(`Runtime state: ${state}`);
-  lines.push(`• Prompt rewrite: ${runtimeOptimizerEnabled && !isEnabledEnv(process.env[NO_PROMPT_REWRITE_ENV]) ? "on" : "off"}`);
-  lines.push(`• OpenAI prompt_cache_key fallback: ${shouldInjectOpenAIPromptCacheKey() ? "on" : "off"}`);
-  lines.push(`• Footer cache stats: on${runtimeOptimizerEnabled ? "" : " (comparison mode)"}`);
-  lines.push(`• Compat warnings: ${runtimeOptimizerEnabled ? "on" : "off"}`);
-  lines.push(`• ${PI_CACHE_RETENTION_ENV}: ${process.env[PI_CACHE_RETENTION_ENV] ?? "(unset)"}`);
+  lines.push(`运行状态：${state}`);
+  lines.push(`• Prompt 重写：${runtimeOptimizerEnabled && !isEnabledEnv(process.env[NO_PROMPT_REWRITE_ENV]) ? "开启" : "关闭"}`);
+  lines.push(`• OpenAI prompt_cache_key 回退：${shouldInjectOpenAIPromptCacheKey() ? "开启" : "关闭"}`);
+  lines.push(`• Footer 缓存统计：开启${runtimeOptimizerEnabled ? "" : "（对比模式）"}`);
+  lines.push(`• Compat 提示：${runtimeOptimizerEnabled ? "开启" : "关闭"}`);
+  lines.push(`• ${PI_CACHE_RETENTION_ENV}：${process.env[PI_CACHE_RETENTION_ENV] ?? "（未设置）"}`);
   if (!runtimeOptimizerEnabled) {
-    lines.push("This is a current-process switch. Run /reload or restart OMP to return to startup behavior.");
+    lines.push("这是当前进程内开关。运行 /reload 或重启 OMP 可恢复到启动时行为。");
   } else if (isEnabledEnv(process.env[NO_PROMPT_REWRITE_ENV]) || !shouldInjectOpenAIPromptCacheKey()) {
-    lines.push("Some features are still disabled by environment variables.");
+    lines.push("仍有部分能力被环境变量关闭。");
   }
   return lines;
 }
@@ -1179,9 +1214,9 @@ function buildAdaptiveThinkingCompatSuggestion(_missing: string[]): Record<strin
 }
 
 function appendAdaptiveThinkingCompatAdviceLines(lines: string[], _missing: string[], placement: CompatAdvicePlacement = {}): void {
-  lines.push("- Adaptive thinking: OMP's built-in model catalog sets this automatically for official Claude models.");
-  lines.push("  Custom channels fronting Anthropic should rely on the bundled catalog metadata;");
-  lines.push("  if the upstream rejects adaptive thinking, verify the model id matches an official release.");
+  lines.push("- 自适应思考：OMP 内置模型目录会为官方 Claude 模型自动设置。");
+  lines.push("  自定义 Anthropic 渠道应依赖内置 catalog 元数据；");
+  lines.push("  如果上游拒绝 adaptive thinking，请确认模型 id 是否匹配官方发布版本。");
   appendCredentialSafeProviderGuidance(lines, placement, {});
 }
 
@@ -1191,10 +1226,10 @@ function buildAdaptiveThinkingCompatWarningText(key: string, _missing: string[])
   const modelId = slashIdx > 0 ? key.slice(slashIdx + 1) : undefined;
   const modelsJsonPath = getModelsJsonDisplayPath();
   const lines: string[] = [
-    `ℹ️ omp-cache-optimizer: ${key} is an adaptive-generation Claude model.`,
-    `OMP's built-in catalog handles adaptive thinking automatically; no models.yml compat key is needed`,
-    `for official models. Custom channels fronting Anthropic may need explicit catalog metadata.`,
-    `See ${modelsJsonPath} -> providers["${providerLabel}"] -> models -> "${modelId ?? "<id>"}".`,
+    `ℹ️ omp-cache-optimizer：${key} 是支持自适应生成的 Claude 模型。`,
+    "OMP 内置 catalog 会自动处理自适应思考；官方模型不需要额外的 models.yml compat 键。",
+    "如果是转发 Anthropic 的自定义渠道，可能仍需要显式 catalog 元数据。",
+    `可参考 ${modelsJsonPath} -> providers["${providerLabel}"] -> models -> "${modelId ?? '<id>'}"。`,
     "",
   ];
   appendAdaptiveThinkingCompatAdviceLines(lines, [], { providerLabel, modelId });
@@ -1972,13 +2007,6 @@ function setSystemPrompt(payload: unknown, text: string): boolean {
     return true;
   }
   if (Array.isArray(record.system) && record.system.length > 0) {
-    // Replace first text block, keep structure
-    const first = asRecord(record.system[0]);
-    if (first && typeof first.text === "string") {
-      first.text = text;
-      return true;
-    }
-    // Fallback: convert to single-block string form
     record.system = [{ type: "text", text }];
     return true;
   }
@@ -1986,11 +2014,8 @@ function setSystemPrompt(payload: unknown, text: string): boolean {
   // google-generative-ai: payload.systemInstruction
   const systemInstruction = asRecord(record.systemInstruction);
   if (systemInstruction && Array.isArray(systemInstruction.parts) && systemInstruction.parts.length > 0) {
-    const firstPart = asRecord(systemInstruction.parts[0]);
-    if (firstPart && typeof firstPart.text === "string") {
-      firstPart.text = text;
-      return true;
-    }
+    systemInstruction.parts = [{ text }];
+    return true;
   }
 
   // openai-completions / openai-responses: payload.messages[] first system/developer message
@@ -2005,11 +2030,8 @@ function setSystemPrompt(payload: unknown, text: string): boolean {
           return true;
         }
         if (Array.isArray(r.content) && r.content.length > 0) {
-          const first = asRecord(r.content[0]);
-          if (first && typeof first.text === "string") {
-            first.text = text;
-            return true;
-          }
+          r.content = text;
+          return true;
         }
       }
     }
@@ -2081,7 +2103,7 @@ function buildSafeOpenAIProxyCompatSuggestion(_missing: string[]): Record<string
 }
 
 function getPromptCacheRetentionUnsupportedHint(): string {
-  return "If this channel returns `400 Unsupported parameter: prompt_cache_retention`, remove/avoid `supportsLongPromptCacheRetention`; this extension does not write that field directly, but OMP may send it when long retention is requested and compat says the proxy supports it.";
+  return "如果这个渠道返回 `400 Unsupported parameter: prompt_cache_retention`，请移除或避免 `supportsLongPromptCacheRetention`；扩展本身不会直接写这个字段，但当 compat 声明支持长缓存保留时，OMP 可能会发送它。";
 }
 
 function hasPromptCacheRetentionUnsupportedSignal(headers: Record<string, string> | undefined): boolean {
@@ -2135,20 +2157,20 @@ function appendCredentialSafeProviderGuidance(lines: string[], placement: Compat
   if (!providerLabel) return;
 
   lines.push("");
-  lines.push("If this channel has no models.yml provider entry yet:");
-  lines.push("- Keep existing authentication as-is; do not copy credentials, tokens, or API keys.");
-  lines.push(`- Add only cache/routing compat overrides in ${getModelsJsonDisplayPath()}.`);
+  lines.push("如果这个渠道在 models.yml 里还没有 provider 配置：");
+  lines.push("- 保留现有认证方式；不要复制 credential、token 或 API key。");
+  lines.push(`- 只在 ${getModelsJsonDisplayPath()} 里添加缓存/路由 compat 覆盖。`);
 
   if (Object.keys(compatSuggestion).length === 0) {
-    lines.push("- No safe copyable override is available for the missing flags shown above.");
+    lines.push("- 上面这些缺失项目前没有安全可复制的 override。");
     return;
   }
 
-  lines.push("Provider-level minimal override:");
+  lines.push("Provider 级最小覆盖：");
   lines.push(JSON.stringify(buildProviderCompatOverride(providerLabel, compatSuggestion), null, 2));
 
   if (placement.modelId) {
-    lines.push("Single-model override (use this if only this model should change):");
+    lines.push("单模型 override（只想影响当前模型时使用）：");
     lines.push(JSON.stringify(buildModelCompatOverride(providerLabel, placement.modelId, compatSuggestion), null, 2));
   }
 }
@@ -2159,21 +2181,19 @@ function appendOpenAIProxyCompatAdviceLines(lines: string[], missing: string[], 
 
   if (hasSafeSuggestion) {
     if (options.includeJsonIntro !== false) {
-      lines.push("Safe default suggestion:");
+      lines.push("安全默认建议：");
     }
     lines.push(JSON.stringify(suggestion, null, 2));
   }
 
-  // OMP divergence: session affinity is handled by multi-credential auth, not compat.
-  // No per-flag advice lines remain; only the optional long-retention guidance below.
   appendCredentialSafeProviderGuidance(lines, options, suggestion);
 }
 
 function appendOptionalOpenAIProxyCompatAdviceLines(lines: string[], optional: string[]): void {
   if (!optional.includes("supportsLongPromptCacheRetention")) return;
   lines.push("");
-  lines.push("Optional (not required, not auto-fixed):");
-  lines.push("- supportsLongPromptCacheRetention: enable only after your endpoint/proxy explicitly supports OpenAI long prompt cache retention.");
+  lines.push("可选项（非必需，不会自动修复）：");
+  lines.push("- supportsLongPromptCacheRetention：仅当 endpoint / proxy 明确支持 OpenAI long prompt cache retention 时再开启。");
   lines.push(`- ${getPromptCacheRetentionUnsupportedHint()}`);
 }
 
@@ -2190,17 +2210,15 @@ function appendOptionalOpenAIProxyCompatAdviceLines(lines: string[], optional: s
  * exercise it via __internals_for_tests.
  */
 function buildOpenAIProxyCompatWarningText(key: string, missing: string[]): string {
-  // Extract provider id from the model key (e.g. "otokapi/gpt-5.5" -> "otokapi").
-  // If no slash is found, fall back to the key itself.
   const slashIdx = key.indexOf("/");
   const providerLabel = slashIdx > 0 ? key.slice(0, slashIdx) : key;
   const modelId = slashIdx > 0 ? key.slice(slashIdx + 1) : undefined;
 
   const modelsJsonPath = getModelsJsonDisplayPath();
   const lines: string[] = [
-    `💡 omp-cache-optimizer: ${key} is a third-party GPT/OpenAI-compatible proxy but merged compat lacks ${missing.join(" and ")}.`,
-    `Edit ${modelsJsonPath} -> providers["${providerLabel}"] -> compat (at the same level as baseUrl/api/apiKey/models).`,
-    ``,
+    `💡 omp-cache-optimizer：${key} 是第三方 GPT/OpenAI 兼容代理，但合并后的 compat 缺少 ${missing.join(" 和 ")}。`,
+    `编辑 ${modelsJsonPath} -> providers["${providerLabel}"] -> compat（与 baseUrl/api/apiKey/models 同级）。`,
+    "",
   ];
 
   appendOpenAIProxyCompatAdviceLines(lines, missing, { providerLabel, modelId });
@@ -2259,20 +2277,16 @@ function buildDeepSeekCompatSuggestion(missing: string[]): Record<string, unknow
 function appendDeepSeekCompatAdviceLines(lines: string[], missing: string[], placement: CompatAdvicePlacement = {}): void {
   const suggestion = buildDeepSeekCompatSuggestion(missing);
   if (Object.keys(suggestion).length > 0) {
-    lines.push("Recommended DeepSeek compat snippet:");
+    lines.push("推荐的 DeepSeek compat 片段：");
     lines.push(JSON.stringify(suggestion, null, 2));
   }
 
   if (missing.includes("requiresReasoningContentForToolCalls")) {
-    lines.push("- requiresReasoningContentForToolCalls: true keeps replayed assistant tool-call turns compatible with DeepSeek reasoning_content requirements.");
+    lines.push("- requiresReasoningContentForToolCalls：保持带工具调用的 assistant 重放与 DeepSeek 的 reasoning_content 要求兼容。");
   }
   if (missing.includes("supportsLongPromptCacheRetention")) {
-    lines.push("- supportsLongPromptCacheRetention: enable for DeepSeek-compatible endpoints that support long cache retention.");
+    lines.push("- supportsLongPromptCacheRetention：仅当 DeepSeek 兼容 endpoint 支持长缓存保留时再开启。");
   }
-  // OMP divergence: thinkingFormat is no longer flagged. DeepSeek reasoning format
-  // is auto-detected by OMP's openai-completions transport; the "deepseek" value
-  // is not a valid OMP thinkingFormat (OMP uses openai|openrouter|zai|qwen|...).
-  // Session affinity is handled by OMP multi-credential auth, not compat keys.
 
   appendCredentialSafeProviderGuidance(lines, placement, suggestion);
 }
@@ -2283,8 +2297,8 @@ function buildDeepSeekCompatWarningText(key: string, missing: string[]): string 
   const modelId = slashIdx > 0 ? key.slice(slashIdx + 1) : undefined;
   const modelsJsonPath = getModelsJsonDisplayPath();
   const lines: string[] = [
-    `💡 omp-cache-optimizer: ${key} is DeepSeek-like but merged compat lacks ${missing.join(" and ")}.`,
-    `Proxies may reduce or hide cache hits. Edit ${modelsJsonPath} -> providers["${providerLabel}"] -> compat (at the same level as baseUrl/api/apiKey/models).`,
+    `💡 omp-cache-optimizer：${key} 看起来是 DeepSeek 风格模型，但合并后的 compat 缺少 ${missing.join(" 和 ")}。`,
+    `这可能让代理降低或隐藏缓存命中。编辑 ${modelsJsonPath} -> providers["${providerLabel}"] -> compat（与 baseUrl/api/apiKey/models 同级）。`,
     "",
   ];
 
@@ -2332,8 +2346,8 @@ const CACHE_PROVIDER_ADAPTERS: CacheProviderAdapter[] = [
       if (getCompat(model).cacheControlFormat === "anthropic") return undefined;
 
       return (
-        `💡 Cache optimizer: ${modelKey(model)} looks Claude/Anthropic-like but OpenAI-compatible compat lacks cacheControlFormat: "anthropic". ` +
-        "OMP may not place Anthropic cache_control breakpoints unless this endpoint supports and enables that compat flag."
+        `💡 omp-cache-optimizer：${modelKey(model)} 看起来是 Claude/Anthropic 风格模型，但 OpenAI 兼容 compat 缺少 cacheControlFormat: "anthropic"。` +
+        "只有当 endpoint 支持并启用了这个 compat 字段时，OMP 才能放置 Anthropic 的 cache_control 断点。"
       );
     },
   },
@@ -3330,30 +3344,26 @@ function formatTokenCount(value: number): string {
   return `${millions.toFixed(2)}M`;
 }
 
+function localizeAdapterLabel(label: string): string {
+  return label.endsWith(" cache") ? `${label.slice(0, -6)} Cache` : label;
+}
+
 function formatCacheStats(adapter: CacheProviderAdapter, stats: CacheStats): string {
   const percent = stats.totalInputTokens > 0
     ? ` (${Math.round((stats.cachedInputTokens / stats.totalInputTokens) * 100)}%)`
     : "";
   const writeText = adapter.showCacheWrite && stats.cacheWriteInputTokens > 0
-    ? ` · write ${formatTokenCount(stats.cacheWriteInputTokens)} tok`
+    ? ` · 写入 ${formatTokenCount(stats.cacheWriteInputTokens)} tok`
     : "";
 
-  return `${adapter.label} ${stats.hitRequests}/${stats.totalRequests} · ${formatTokenCount(stats.cachedInputTokens)}/${formatTokenCount(stats.totalInputTokens)} tok${percent}${writeText}`;
+  return `${localizeAdapterLabel(adapter.label)} ${stats.hitRequests}/${stats.totalRequests} · ${formatTokenCount(stats.cachedInputTokens)}/${formatTokenCount(stats.totalInputTokens)} tok${percent}${writeText}`;
 }
 
-/**
- * Compute a hit-ratio percentage string for a value between 0 and 1.
- * Returns e.g. "75%", "0%", "100%", or "N/A" for zero total.
- */
 function formatHitRatio(hits: number, total: number): string {
-  if (total <= 0) return "N/A";
+  if (total <= 0) return "无数据";
   return `${Math.round((hits / total) * 100)}%`;
 }
 
-/**
- * Format a token-to-M abbreviation for stats output.
- * Example: 1500000 → "1.50M"
- */
 function formatTokenM(value: number): string {
   const millions = Math.max(0, Math.round(value)) / 1_000_000;
   if (millions === 0) return "0";
@@ -3362,27 +3372,18 @@ function formatTokenM(value: number): string {
   return millions.toFixed(2);
 }
 
-/**
- * Check if an assistant message's usage fields appear to be missing or empty.
- * Returns true when normalized fields (input, cacheRead, cacheWrite) are all
- * absent/zero AND raw usage fields (prompt_tokens, etc.) are also absent/zero
- * for the given adapter.
- */
 function hasMissingUsageFields(message: unknown, adapter: CacheProviderAdapter): boolean {
   const usage = usageRecordFromAssistant(message);
   if (!usage) return true;
 
-  // Check normalized fields
   const input = getNonNegativeNumber(usage, "input");
   const cacheRead = getNonNegativeNumber(usage, "cacheRead");
   const cacheWrite = getNonNegativeNumber(usage, "cacheWrite");
 
-  // If normalized fields exist with non-zero values, usage is present
   if (cacheRead !== undefined || cacheWrite !== undefined || (input !== undefined && input > 0)) {
     return false;
   }
 
-  // Check raw usage for the adapter's provider family
   const rawUsage = adapter.normalizeUsage(message);
   if (!rawUsage || (rawUsage.cacheRead === 0 && rawUsage.cacheWrite === 0 && rawUsage.totalInput === 0)) {
     return true;
@@ -3391,64 +3392,55 @@ function hasMissingUsageFields(message: unknown, adapter: CacheProviderAdapter):
   return false;
 }
 
-/**
- * Build a summary string for the recent trend (last N samples).
- * Example: "Recent 10: 7/10 hits · 65% tok cached · no missing usage"
- */
 function formatRecentTrendSummary(samples: CacheUsageSample[], maxCount: number): string {
   const recent = samples.slice(-maxCount);
-  if (recent.length === 0) return `Recent ${maxCount}: no samples yet`;
+  if (recent.length === 0) return `最近 ${maxCount} 次：暂无样本`;
 
   const hits = recent.filter((s) => s.hit).length;
   const totalCached = recent.reduce((sum, s) => sum + s.cachedInputTokens, 0);
   const totalInput = recent.reduce((sum, s) => sum + s.totalInputTokens, 0);
   const missingCount = recent.filter((s) => s.missingUsageFields).length;
 
-  const hitRatio = formatHitRatio(hits, recent.length);
-  const tokenRatio = totalInput > 0 ? formatHitRatio(totalCached, totalInput) : "N/A";
+  const tokenRatio = totalInput > 0 ? formatHitRatio(totalCached, totalInput) : "无数据";
 
-  let result = `Recent ${recent.length}/${maxCount}: ${hits}/${recent.length} hits · ${tokenRatio} tok cached`;
+  let result = `最近 ${recent.length}/${maxCount} 次：${hits}/${recent.length} 次命中 · ${tokenRatio} tok 已缓存`;
   if (missingCount > 0) {
-    result += ` · ${missingCount} missing usage`;
+    result += ` · ${missingCount} 条 usage 缺失`;
   }
   return result;
 }
 
-/**
- * Build the output for `/cache-optimizer stats`.
- */
 function buildStatsOutput(model: PiModel | undefined, adapter: CacheProviderAdapter | undefined, stats: CacheStats | undefined, recentSamples: CacheUsageSample[]): string {
   const lines: string[] = [];
 
   if (!model || !adapter) {
-    lines.push("ℹ️ No cache-adapter-matched model active. Select a model with a recognized provider family.");
+    lines.push("ℹ️ 当前活动模型未匹配到缓存适配器。请选择可识别模型家族后再查看统计。");
     return lines.join("\n");
   }
 
   const key = modelKey(model);
   const currentStats = stats ?? emptyCacheStats();
 
-  lines.push(`Model key: ${key}`);
-  lines.push(`Adapter:   ${adapter.label}`);
+  lines.push(`模型键：${key}`);
+  lines.push(`适配器：${localizeAdapterLabel(adapter.label)}`);
   lines.push("");
-  lines.push("── Today ──");
-  lines.push(`Requests:      ${currentStats.hitRequests} hit / ${currentStats.totalRequests} total · ${formatHitRatio(currentStats.hitRequests, currentStats.totalRequests)}`);
-  lines.push(`Cached tokens: ${formatTokenM(currentStats.cachedInputTokens)}M / ${formatTokenM(currentStats.totalInputTokens)}M input · ${currentStats.totalInputTokens > 0 ? `${Math.round((currentStats.cachedInputTokens / currentStats.totalInputTokens) * 100)}%` : "N/A"}`);
+  lines.push("── 今日 ──");
+  lines.push(`请求数：${currentStats.hitRequests} 次命中 / ${currentStats.totalRequests} 次总计 · ${formatHitRatio(currentStats.hitRequests, currentStats.totalRequests)}`);
+  lines.push(`缓存 tokens：${formatTokenM(currentStats.cachedInputTokens)}M / ${formatTokenM(currentStats.totalInputTokens)}M 输入 · ${currentStats.totalInputTokens > 0 ? `${Math.round((currentStats.cachedInputTokens / currentStats.totalInputTokens) * 100)}%` : "无数据"}`);
   if (currentStats.cacheWriteInputTokens > 0) {
-    lines.push(`Cache write:   ${formatTokenM(currentStats.cacheWriteInputTokens)}M tok`);
+    lines.push(`缓存写入：${formatTokenM(currentStats.cacheWriteInputTokens)}M tok`);
   }
 
   lines.push("");
-  lines.push("── Recent trend ──");
+  lines.push("── 近期趋势 ──");
   lines.push(formatRecentTrendSummary(recentSamples, 10));
   lines.push(formatRecentTrendSummary(recentSamples, 30));
 
-  // Check if any sample has missingUsageFields flagged
   const missingAny = recentSamples.some((s) => s.missingUsageFields);
   if (missingAny) {
     lines.push("");
-    lines.push("⚠️ Some recent responses had missing or empty cache usage fields. Footer may under-report hits.");
-    lines.push("   The proxy may not return prompt_cache_hit_tokens or usage.input/cacheRead in responses.");
+    lines.push("⚠️ 近期有响应缺少或返回了空的缓存 usage 字段，footer 命中率可能偏低。");
+    lines.push("   代理可能没有返回 prompt_cache_hit_tokens，或没有返回 usage.input/cacheRead 等字段。");
   }
 
   return lines.join("\n");
@@ -3889,19 +3881,14 @@ function describeRouterChannelDiagnostics(model: PiModel): string[] {
   const baseUrl = lower(model.baseUrl || "");
   const provider = lower(model.provider);
 
-  // Router/channel diagnostics only apply to OpenAI-compatible proxy APIs.
-  // Native APIs like mistral-conversations, azure-openai-responses,
-  // anthropic-messages, or bedrock-converse-stream are intentionally excluded.
   if (api === "azure-openai-responses" || isMistralConversationsApi(api) || !isOpenAICompatibleApi(api)) {
     return notes;
   }
 
-  // Official OpenAI bypass — no notes needed.
   if (isOfficialOpenAIBaseUrl(model)) {
     return notes;
   }
 
-  // ── 1. OpenRouter ────────────────────────────────────────────────
   if (
     baseUrl.includes("openrouter.ai") ||
     baseUrl.includes("openrouter") ||
@@ -3913,32 +3900,28 @@ function describeRouterChannelDiagnostics(model: PiModel): string[] {
     const hasOrder = !!routing?.order;
 
     notes.push(
-      "🔀 Router/channel: OpenRouter detected. OpenRouter is a multi-provider router; " +
-      "low cache hit rates are common when each turn lands on a different upstream provider.",
+      "🔀 路由/渠道：检测到 OpenRouter。OpenRouter 是多上游路由器；如果每一轮落到不同上游，缓存命中率偏低很常见。",
     );
 
     if (!hasOnly && !hasOrder) {
       notes.push(
-        "   Suggestion: Add an openRouterRouting config to fix the upstream provider. " +
-        "Example for models.yml -> providers[\"<providerId>\"] -> compat:",
+        '   建议：添加 openRouterRouting，把上游固定住。位置：models.yml -> providers["<providerId>"] -> compat：',
       );
       notes.push(
         `   { "supportsLongPromptCacheRetention": true, ` +
         `"openRouterRouting": { "only": ["<provider-slug>"] } }`,
       );
       notes.push(
-        '   Replace <provider-slug> with the actual OpenRouter provider slug (e.g. "openai", "anthropic").',
+        '   把 <provider-slug> 替换成真实的 OpenRouter provider slug（如 "openai"、"anthropic"）。',
       );
       notes.push(
-        "   Alternatively, use openRouterRouting.order: [\"<provider-slug>\", \"...\"] for fallback order. " +
-        "Only set supportsLongPromptCacheRetention if your upstream supports long cache retention.",
+        '   也可以用 openRouterRouting.order: ["<provider-slug>", "..."] 作为回退顺序。只有在上游支持长缓存保留时才设置 supportsLongPromptCacheRetention。',
       );
     }
 
     return notes;
   }
 
-  // ── 2. Vercel AI Gateway ─────────────────────────────────────────
   if (
     baseUrl.includes("ai-gateway.vercel.sh") ||
     provider.includes("vercel") ||
@@ -3950,81 +3933,54 @@ function describeRouterChannelDiagnostics(model: PiModel): string[] {
     const hasOrder = !!routing?.order;
 
     notes.push(
-      "🔀 Router/channel: Vercel AI Gateway detected. The gateway may route to different " +
-      "provider endpoints per request, reducing cache locality.",
+      "🔀 路由/渠道：检测到 Vercel AI Gateway。这个网关可能把不同请求分发到不同 provider endpoint，降低缓存局部性。",
     );
 
     if (!hasOnly && !hasOrder) {
       notes.push(
-        "   Suggestion: Add a vercelGatewayRouting config to fix the upstream. " +
-        "Example for models.yml -> providers[\"<providerId>\"] -> compat:",
+        '   建议：添加 vercelGatewayRouting，把上游固定住。位置：models.yml -> providers["<providerId>"] -> compat：',
       );
       notes.push(
         `   { "supportsLongPromptCacheRetention": true, ` +
         `"vercelGatewayRouting": { "only": ["<provider-id>"] } }`,
       );
       notes.push(
-        "   Replace <provider-id> with the actual Vercel provider ID (e.g. \"openai\").",
+        '   把 <provider-id> 替换成真实的 Vercel provider ID（如 "openai"）。',
       );
       notes.push(
-        "   Only set supportsLongPromptCacheRetention if your upstream supports it.",
+        "   只有在上游支持长缓存保留时才设置 supportsLongPromptCacheRetention。",
       );
     }
 
     return notes;
   }
 
-  // ── 3. LiteLLM / OneAPI / NewAPI / VoAPI (self-hosted aggregation) ──
   const aggregationPatterns = ["litellm", "oneapi", "one-api", "newapi", "new-api", "voapi", "vo-api"];
   if (
     aggregationPatterns.some((p) => baseUrl.includes(p)) ||
     aggregationPatterns.some((p) => provider.includes(p))
   ) {
     notes.push(
-      "🔀 Router/channel: Self-hosted aggregation proxy detected (LiteLLM / OneAPI / NewAPI / VoAPI). " +
-      "These proxies route to multiple upstream accounts or instances, which can split the cache.",
+      "🔀 路由/渠道：检测到自建聚合代理（LiteLLM / OneAPI / NewAPI / VoAPI）。这类代理常把请求分到多个上游账号或实例，导致缓存被拆散。",
     );
-    notes.push(
-      "   Suggestions:",
-    );
-    notes.push(
-      "   • Ensure the proxy can fix to a single upstream per session (session_id affinity).",
-    );
-    notes.push(
-      "   • Forward prompt_cache_key and session-affinity headers to the upstream.",
-    );
-    notes.push(
-      "   • Return cache usage fields (prompt_cache_hit_tokens, etc.) in the response.",
-    );
-    notes.push(
-      `   Safe compat default: { "supportsLongPromptCacheRetention": true }`,
-    );
-    notes.push(
-      `   Add supportsLongPromptCacheRetention only if the proxy explicitly supports prompt_cache_retention.`,
-    );
+    notes.push("   建议：");
+    notes.push("   • 确保代理能按 session 固定到单一上游（session_id affinity）。");
+    notes.push("   • 向上游透传 prompt_cache_key 与会话亲和性相关 header。");
+    notes.push("   • 在响应里返回缓存 usage 字段（如 prompt_cache_hit_tokens）。");
+    notes.push(`   可作为起点的 compat：{ "supportsLongPromptCacheRetention": true }`);
+    notes.push("   只有在代理明确支持 prompt_cache_retention 时才加 supportsLongPromptCacheRetention。");
 
     return notes;
   }
 
-  // ── 4. Generic third-party OpenAI-compatible proxy ─────────────────
   if (api === "openai-completions" && baseUrl) {
     const missing = describeMissingCacheCompatForModel(model);
-    notes.push(
-      "🔀 Router/channel: Third-party OpenAI-compatible proxy. If cache hit rates are low:",
-    );
-    notes.push(
-      "   • Verify the proxy routes to the same upstream account/instance per session.",
-    );
-    notes.push(
-      "   • Ensure the proxy forwards prompt_cache_key and sends session-affinity headers.",
-    );
-    notes.push(
-      "   • Check that the proxy returns cache usage fields (prompt_cache_hit_tokens etc.).",
-    );
+    notes.push("🔀 路由/渠道：第三方 OpenAI 兼容代理。如果缓存命中率偏低：");
+    notes.push("   • 确认代理会把同一 session 路由到同一个上游账号/实例。");
+    notes.push("   • 确认代理会透传 prompt_cache_key，并发送会话亲和性相关 header。");
+    notes.push("   • 确认代理会返回缓存 usage 字段（如 prompt_cache_hit_tokens）。");
     if (missing.length > 0) {
-      notes.push(
-        `   • The compat flags above (${missing.join(", ")}) are recommended for cache stability.`,
-      );
+      notes.push(`   • 上面这些 compat 字段（${missing.join(", ")}）有助于提升缓存稳定性。`);
     }
 
     return notes;
@@ -4038,38 +3994,38 @@ function getCompatCheckNotApplicableLines(model: PiModel): string[] {
 
   if (isMistralConversationsApi(api)) {
     return [
-      "ℹ️ Compat check not applicable for this model.",
-      "   Native Mistral `mistral-conversations` uses provider-native transport; OpenAI-compatible proxy compat flags do not apply.",
+      "ℹ️ 当前模型不适用 compat 检查。",
+      "   原生 Mistral `mistral-conversations` 使用 provider 原生传输；OpenAI 兼容代理 compat 不适用。",
     ];
   }
 
   if (api === "azure-openai-responses") {
     return [
-      "ℹ️ Compat check not applicable for this model.",
-      "   Native Azure OpenAI Responses uses the Responses transport; OpenAI-compatible proxy compat flags do not apply.",
+      "ℹ️ 当前模型不适用 compat 检查。",
+      "   原生 Azure OpenAI Responses 使用 Responses 传输；OpenAI 兼容代理 compat 不适用。",
     ];
   }
 
   if (api === "openai-codex-responses" || (api === "openai-responses" && isOfficialOpenAIBaseUrl(model))) {
     return [
-      "ℹ️ Compat check not applicable for this model.",
-      "   Native Responses transports already use core runtime request handling; OpenAI-compatible proxy compat flags do not apply.",
+      "ℹ️ 当前模型不适用 compat 检查。",
+      "   原生 Responses 传输已经使用运行时核心请求链路；OpenAI 兼容代理 compat 不适用。",
     ];
   }
 
-  return ["ℹ️ Compat check not applicable for this model."];
+  return ["ℹ️ 当前模型不适用 compat 检查。"];
 }
 
 function buildDoctorDiagnosis(model: PiModel, options: { promptCacheRetention400?: boolean } = {}): string {
   const lines: string[] = [];
-  lines.push(`Provider: ${model.provider}`);
-  lines.push(`Model:    ${model.id}`);
-  if (model.name && model.name !== model.id) lines.push(`Name:     ${model.name}`);
-  lines.push(`API:      ${model.api}`);
-  lines.push(`Base URL: ${model.baseUrl || "(default)"}`);
+  lines.push(`提供方：${model.provider}`);
+  lines.push(`模型：    ${model.id}`);
+  if (model.name && model.name !== model.id) lines.push(`名称：    ${model.name}`);
+  lines.push(`API：      ${model.api}`);
+  lines.push(`Base URL： ${model.baseUrl || "（默认）"}`);
 
   const compat = getCompat(model);
-  lines.push(`Compat:   ${JSON.stringify(compat)}`);
+  lines.push(`Compat：   ${JSON.stringify(compat)}`);
 
   const adaptiveThinkingApplicable = isAdaptiveThinkingCompatApplicable(model);
   const deepSeekCompatApplicable = isDeepSeekCompatCheckApplicable(model);
@@ -4082,10 +4038,10 @@ function buildDoctorDiagnosis(model: PiModel, options: { promptCacheRetention400
   const advisoryMissing = missing.filter(m => !safeFixableMissing.includes(m));
 
   if (safeFixableMissing.length > 0) {
-    lines.push(`⚠️  Missing compat flags: ${safeFixableMissing.join(", ")}`);
+    lines.push(`⚠️ 缺少 compat 字段：${safeFixableMissing.join(", ")}`);
   }
   if (advisoryMissing.length > 0) {
-    lines.push(`ℹ️  Optional: ${advisoryMissing.join(", ")} (enable only if needed)`);
+    lines.push(`ℹ️ 可选项：${advisoryMissing.join(", ")}（仅在确认支持时启用）`);
   }
 
   if (missing.length > 0) {
@@ -4093,7 +4049,7 @@ function buildDoctorDiagnosis(model: PiModel, options: { promptCacheRetention400
     const slashIdx = key.indexOf("/");
     const providerLabel = slashIdx > 0 ? key.slice(0, slashIdx) : key;
     const modelsJsonPath = getModelsJsonDisplayPath();
-    lines.push(`Edit ${modelsJsonPath} -> providers["${providerLabel}"] -> compat (same level as baseUrl/api/apiKey/models).`);
+    lines.push(`编辑 ${modelsJsonPath} -> providers["${providerLabel}"] -> compat（与 baseUrl/api/apiKey/models 同级）。`);
     if (adaptiveThinkingApplicable) {
       appendAdaptiveThinkingCompatAdviceLines(lines, missing, { providerLabel, modelId: model.id });
     } else if (deepSeekCompatApplicable) {
@@ -4103,7 +4059,7 @@ function buildDoctorDiagnosis(model: PiModel, options: { promptCacheRetention400
       appendOptionalOpenAIProxyCompatAdviceLines(lines, optionalOpenAIProxyCompat);
     }
   } else if (adaptiveThinkingApplicable || deepSeekCompatApplicable || isCompatCheckApplicable(model)) {
-    lines.push("✅ Compat fully configured.");
+    lines.push("✅ compat 配置完整。");
     appendOptionalOpenAIProxyCompatAdviceLines(lines, optionalOpenAIProxyCompat);
   } else {
     lines.push(...getCompatCheckNotApplicableLines(model));
@@ -4112,14 +4068,13 @@ function buildDoctorDiagnosis(model: PiModel, options: { promptCacheRetention400
   if (isPromptCacheRetention400Applicable(model)) {
     lines.push("");
     if (options.promptCacheRetention400) {
-      lines.push("⚠️  A 400 response was observed while supportsLongPromptCacheRetention is enabled.");
+      lines.push("⚠️ 在启用 supportsLongPromptCacheRetention 时观测到一次 400 响应。");
       lines.push(`   ${getPromptCacheRetentionUnsupportedHint()}`);
     } else {
-      lines.push(`ℹ️ Long retention is enabled. ${getPromptCacheRetentionUnsupportedHint()}`);
+      lines.push(`ℹ️ 已启用长缓存保留。${getPromptCacheRetentionUnsupportedHint()}`);
     }
   }
 
-  // ── Router/channel diagnostics ──
   const routerNotes = describeRouterChannelDiagnostics(model);
   if (routerNotes.length > 0) {
     lines.push("");
@@ -4128,31 +4083,24 @@ function buildDoctorDiagnosis(model: PiModel, options: { promptCacheRetention400
     }
   }
 
-  // ── Integrity diagnostics ──
   if (lastPromptIntegrityWarningAt > 0) {
     const ago = Date.now() - lastPromptIntegrityWarningAt;
     const mins = Math.floor(ago / 60000);
     if (mins < 5) {
       lines.push("");
-      lines.push("⚠️  Recent prompt integrity issue detected:");
-      lines.push(`   Last detected ${mins > 0 ? `${mins} min` : `${Math.floor(ago / 1000)}s`} ago. The prompt reorder was`);
-      lines.push(`   skipped on that turn to preserve structural markers.`);
-      lines.push(`   Common causes: extension system prompt format change, substring collision.`);
-      lines.push(`   Steps:`);
-      lines.push(`     1. Run /reload to reset (may clear transient issues).`);
-      lines.push(`     2. Set PI_CACHE_OPTIMIZER_NO_PROMPT_REWRITE=1 & /reload to disable reorder.`);
-      lines.push(`     3. If persistent, file an issue with this doctor output.`);
+      lines.push("⚠️ 最近检测到 prompt 完整性问题：");
+      lines.push(`   最近一次检测于 ${mins > 0 ? `${mins} 分钟` : `${Math.floor(ago / 1000)} 秒`}前；该轮已跳过 prompt 重排以保留结构标记。`);
+      lines.push("   常见原因：扩展的 system prompt 格式变化，或子串碰撞。");
+      lines.push("   建议步骤：");
+      lines.push("     1. 运行 /reload 重置（可清除瞬态问题）。");
+      lines.push("     2. 设置 PI_CACHE_OPTIMIZER_NO_PROMPT_REWRITE=1 后 /reload，禁用重排。");
+      lines.push("     3. 若持续复现，请带 doctor 输出提 issue。");
     }
   }
 
   return lines.join("\n");
 }
 
-/**
- * Build a "Cache diagnosis" section for low-hit causes, appended to doctor output.
- * This is a separate function because it depends on per-session state (recent samples,
- * per-model stats) that is not available at the module level.
- */
 function buildLowHitDiagnosis(
   model: PiModel,
   adapter: CacheProviderAdapter | undefined,
@@ -4161,101 +4109,74 @@ function buildLowHitDiagnosis(
 ): string[] {
   const lines: string[] = [];
 
-  // 1. Missing compat flags (adapter-aware: DeepSeek has extra reasoning compat)
   const fixSugLHD = buildFixSuggestion(model);
   const safeFixableMissingLHD = fixSugLHD ? Object.keys(fixSugLHD.compatKeys) : [];
-
-  // 2. Router/channel risk (reuse existing check)
   const routerNotes = describeRouterChannelDiagnostics(model);
-
-  // 3. Recent samples missing usage fields
   const missingUsageSamples = samples.filter((s) => s.missingUsageFields).length;
-
-  // 4. Recent trend analysis
   const recent10 = samples.slice(-10);
   const recent10Hits = recent10.filter((s) => s.hit).length;
   const recent10Total = recent10.length;
   const recent10Cached = recent10.reduce((sum, s) => sum + s.cachedInputTokens, 0);
   const recent10Input = recent10.reduce((sum, s) => sum + s.totalInputTokens, 0);
-
-  // 5. Today's overall trend from persisted stats
   const todayStats = stats ?? emptyCacheStats();
 
   const hasMissingCompat = safeFixableMissingLHD.length > 0;
   const hasRouterRisk = routerNotes.length > 0;
   const hasUsageMissing = missingUsageSamples > 0;
-
-  // Today's cached-token ratio is used both inside and outside the recent-sample
-  // branch. Keep it block-external so doctor/stats never throw for low-hit
-  // models that have persisted counters but no recent in-memory samples.
   const todayHitRatio = todayStats.totalInputTokens > 0
     ? Math.round((todayStats.cachedInputTokens / todayStats.totalInputTokens) * 100)
     : 0;
 
-  // Determine if there are actual issues worth flagging
   const hasActualIssues = hasMissingCompat || hasUsageMissing ||
-    // Low hit trend (today total > 3 and hit ratio < 30%)
     (todayStats.totalRequests > 3 && todayStats.totalInputTokens > 0 &&
      (todayStats.cachedInputTokens / todayStats.totalInputTokens) < 0.3) ||
-    // Low hit rate in recent samples (recent10Total >= 3 and all misses)
     (recent10Total >= 3 && recent10Hits === 0);
 
-  // Skip section if no issues
   if (!hasActualIssues && !(hasRouterRisk && (hasMissingCompat || hasUsageMissing))) {
     return lines;
   }
 
   lines.push("");
-  lines.push("── Cache diagnosis ──");
+  lines.push("── 缓存诊断 ──");
 
-  // Priority 1: missing compat flags
   if (hasMissingCompat) {
-    lines.push(`⚠️  Missing compat flags: ${safeFixableMissingLHD.join(", ")}`);
-    lines.push("   These flags enable prompt caching and session-affinity routing.");
-    lines.push("   Run /cache-optimizer compat for edit instructions.");
+    lines.push(`⚠️ 缺少 compat 字段：${safeFixableMissingLHD.join(", ")}`);
+    lines.push("   这些字段有助于稳定 prompt 缓存与上游路由粘性。");
+    lines.push("   可运行 /cache-optimizer compat 查看编辑建议。");
   }
 
-  // Priority 2: router/channel risk (only flag when there are other issues)
-  // Router notes are already shown in the main doctor output, so we only
-  // mention them in the diagnosis section when they compound a problem.
   if (hasRouterRisk && (hasMissingCompat || hasUsageMissing || hasActualIssues)) {
-    lines.push("🔀 Router/channel proxy detected — see routing notes above.");
+    lines.push("🔀 检测到路由/代理风险 —— 详见上方路由诊断。");
   }
 
-  // Priority 3: usage fields missing
   if (hasUsageMissing) {
-    lines.push(`⚠️  ${missingUsageSamples}/${samples.length} recent responses had missing/empty usage fields.`);
-    lines.push("   Footer may under-report cache hit rate.");
-    lines.push("   Verify the proxy returns prompt-level usage (prompt_tokens, input_tokens_details).");
+    lines.push(`⚠️ 最近 ${samples.length} 条样本里有 ${missingUsageSamples} 条缺少或返回了空的 usage 字段。`);
+    lines.push("   Footer 命中率可能会被低估。");
+    lines.push("   请确认代理会返回 prompt 级 usage（如 prompt_tokens、input_tokens_details）。");
   }
 
-  // Priority 4: recent trend low
   if (recent10Total > 0) {
-    const hitRatio = recent10Input > 0 ? Math.round((recent10Cached / recent10Input) * 100) : 0;
     if (recent10Hits === 0 && todayStats.totalRequests > 3 && todayHitRatio < 30) {
-      lines.push(`📉 Cache hit rate is low: ${todayHitRatio}% today (${recent10Total} recent samples).`);
-      lines.push("   Likely causes: proxy routing to different backends per request,");
-      lines.push("   or prompt prefix changes across turns.");
-      lines.push("   Verify upstream routing stickiness and supportsLongPromptCacheRetention compat.");
+      lines.push(`📉 今日缓存命中率偏低：${todayHitRatio}%（最近 ${recent10Total} 条样本）。`);
+      lines.push("   常见原因：代理把请求路由到不同后端，或 prompt 前缀在各轮之间变化。");
+      lines.push("   请检查上游路由粘性，以及 supportsLongPromptCacheRetention 配置是否正确。");
     } else if (todayHitRatio < 30 && todayStats.totalRequests > 3) {
-      lines.push(`📉 Cache hit rate is low: ${todayHitRatio}% today (${todayStats.totalRequests} total requests).`);
-      lines.push("   Check compat flags and proxy upstream routing.");
+      lines.push(`📉 今日缓存命中率偏低：${todayHitRatio}%（共 ${todayStats.totalRequests} 次请求）。`);
+      lines.push("   请检查 compat 配置与代理上游路由。");
     }
 
-    // Show brief trend summary if there are enough samples
     if (recent10Total >= 3) {
       const trend = formatRecentTrendSummary(samples, 10);
       lines.push(`📊 ${trend}`);
     }
   }
 
-  // For fully configured but low hit models, emphasize sticky routing
   if (!hasMissingCompat && !hasRouterRisk && todayStats.totalRequests > 3 && todayHitRatio < 30) {
-    lines.push("💡 Compat is configured but cache hit rate remains low.");
-    lines.push("   Possible causes:");
-    lines.push("   • Proxy still routes to multiple backends — check session affinity on the proxy side.");
-    lines.push("   • Prompt prefix varies per turn — check dynamic context in system prompt.");
-    lines.push("   • Provider does not return cache usage fields — footer can't measure hits.");
+    lines.push("💡 compat 已配置完整，但缓存命中率仍然偏低。");
+    lines.push("   可能原因：");
+    lines.push("   • 代理仍把请求分发到多个后端 —— 请检查代理侧的会话粘性。");
+    lines.push("   • prompt 前缀每轮都在变化 —— 请检查 system prompt 中的动态上下文。");
+    lines.push("   • provider 没有返回缓存 usage 字段 —— footer 无法准确测量命中。");
   }
 
   return lines;
@@ -4282,16 +4203,16 @@ function buildCompatDiagnosis(model: PiModel): string | undefined {
     const slashIdx = key.indexOf("/");
     const providerLabel = slashIdx > 0 ? key.slice(0, slashIdx) : key;
     const modelsJsonPath = getModelsJsonDisplayPath();
-    lines.push(`Active model: ${key}`);
+    lines.push(`当前模型：${key}`);
     if (safeFixableMissingC.length > 0) {
-      lines.push(`Safe-fixable: ${safeFixableMissingC.join(", ")}`);
+      lines.push(`可安全修复：${safeFixableMissingC.join(", ")}`);
     }
     if (advisoryMissingC.length > 0) {
-      lines.push(`Optional: ${advisoryMissingC.join(", ")} (enable only if needed)`);
+      lines.push(`可选项：${advisoryMissingC.join(", ")}（仅在确认支持时启用）`);
     }
     lines.push("");
-    lines.push(`Edit ${modelsJsonPath} -> providers["${providerLabel}"] -> compat`);
-    lines.push(`(at the same level as baseUrl/api/apiKey/models).`);
+    lines.push(`编辑 ${modelsJsonPath} -> providers["${providerLabel}"] -> compat`);
+    lines.push("（与 baseUrl/api/apiKey/models 同级）。");
     if (adaptiveThinkingApplicable) {
       appendAdaptiveThinkingCompatAdviceLines(lines, missing, { providerLabel, modelId: model.id });
     } else if (deepSeekCompatApplicable) {
@@ -4302,10 +4223,9 @@ function buildCompatDiagnosis(model: PiModel): string | undefined {
     }
   }
 
-  // When compat is fully configured but router/optional notes exist, prefix the status.
   if ((routerNotes.length > 0 || optionalOpenAIProxyCompat.length > 0) && missing.length === 0) {
     if (adaptiveThinkingApplicable || deepSeekCompatApplicable || isCompatCheckApplicable(model)) {
-      lines.push("✅ Compat fully configured.");
+      lines.push("✅ compat 配置完整。");
       if (isPromptCacheRetention400Applicable(model)) {
         lines.push(getPromptCacheRetentionUnsupportedHint());
       }
@@ -5422,6 +5342,10 @@ export const __internals_for_tests = {
   hashSessionId,
   makeSessionModelKey,
   modelKeyFromSessionKey,
+  makePromptRewriteContextKey,
+  rememberPromptRewriteContext,
+  getPromptRewriteContext,
+  PROMPT_REWRITE_CONTEXT_TTL_MS,
   filterRestorableStatsForSession,
   parsePersistedRoutedModelRef,
   routedModelRefToPiModel,
@@ -5495,11 +5419,10 @@ export default function (pi: ExtensionAPI) {
   let latestCacheHint: PiCacheHintSnapshot | undefined;
   // OMP divergence: prompt rewriting moved from before_agent_start to
   // before_provider_request (OMP's before_agent_start can only inject messages,
-  // not mutate systemPrompt). We cache systemPromptOptions + route snapshot here
-  // so before_provider_request can apply the 3-step pipeline to the payload.
-  let pendingPromptOptions: BuildSystemPromptOptions | undefined;
-  let pendingRouteSnapshot: PiRouteSnapshot | undefined;
-  let pendingRoutedModel: PiModel | undefined;
+  // not mutate systemPrompt). Store prompt options per session/model so an
+  // overlapping turn or sub-agent cannot overwrite another request's rewrite
+  // context before before_provider_request fires.
+  const promptRewriteContexts = new Map<string, PromptRewriteContext>();
   const PERSIST_DEBOUNCE_MS = 2000;
   /** In-memory recent usage samples per model key (not persisted, cleared on reload). */
   const recentSamplesByModelKey = new Map<string, CacheUsageSample[]>();
@@ -5823,7 +5746,7 @@ export default function (pi: ExtensionAPI) {
         const statsText = formatCacheStats(realEntry.adapter, realEntry.stats);
         statusText = runtimeOptimizerEnabled
           ? statsText
-          : `Cache Optimizer disabled · ${statsText}`;
+          : `缓存优化已关闭 · ${statsText}`;
       }
     }
 
@@ -5834,7 +5757,7 @@ export default function (pi: ExtensionAPI) {
       const sk = displayModel ? sessionModelKey(displayModel) : undefined;
       const stats = sk ? cacheStatsByModel[sk] : undefined;
       const statsText = formatCacheStats(adapter, stats ?? emptyCacheStats());
-      statusText = runtimeOptimizerEnabled ? statsText : `Cache Optimizer disabled · ${statsText}`;
+      statusText = runtimeOptimizerEnabled ? statsText : `缓存优化已关闭 · ${statsText}`;
     }
 
     // If optimizeSystemPrompt detected structural truncation on this or
@@ -5842,7 +5765,7 @@ export default function (pi: ExtensionAPI) {
     // /reload before continuing. The flag resets after emission so a
     // single-turn glitch does not permanently taint the footer.
     if (promptTruncationDetected && statusText !== undefined) {
-      statusText = statusText + " ⚠️ integrity";
+      statusText = statusText + " ⚠️ 完整性";
       promptTruncationDetected = false;
       lastPromptIntegrityWarningAt = Date.now();
 
@@ -5850,12 +5773,12 @@ export default function (pi: ExtensionAPI) {
       if (!integrityNotificationShown) {
         integrityNotificationShown = true;
         ctx.ui.notify(
-          `⚠️ ${LOG_PREFIX}: A prompt structural marker was lost during reorder on this turn. ` +
-          `The original prompt was used instead to preserve integrity.\n\n` +
-          `Recovery steps:\n` +
-          `1. Run /reload to reset (may clear transient issues).\n` +
-          `2. Set PI_CACHE_OPTIMIZER_NO_PROMPT_REWRITE=1 and /reload to disable reorder.\n` +
-          `3. If persistent, run /cache-optimizer doctor and file an issue (no API keys/prompts).`,
+          `⚠️ ${LOG_PREFIX}：本轮重排导致一个 prompt 结构标记丢失。` +
+          `为保证完整性，已回退到原始 prompt。\n\n` +
+          `恢复步骤：\n` +
+          `1. 运行 /reload 重置（可清除瞬态问题）。\n` +
+          `2. 设置 PI_CACHE_OPTIMIZER_NO_PROMPT_REWRITE=1 后 /reload，禁用重排。\n` +
+          `3. 若持续复现，请运行 /cache-optimizer doctor 并提 issue（不要包含 API key / prompt）。`,
           "warning",
         );
       }
@@ -5874,7 +5797,7 @@ export default function (pi: ExtensionAPI) {
       // OpenAI-compatible proxies) do NOT trigger the marker — the doctor/compat
       // commands still mention them as optional guidance.
       if (buildFixSuggestion(displayModel) !== undefined) {
-        statusText = statusText + " ⚠️ compat";
+        statusText = statusText + " ⚠️ 配置";
       }
     }
 
@@ -5913,17 +5836,18 @@ export default function (pi: ExtensionAPI) {
       ? findModelInRegistry(_ctx.modelRegistry, routeSnapshot.provider, routeSnapshot.modelId) ?? routeSnapshotToPiModel(routeSnapshot, _ctx.model)
       : undefined;
 
-    // OMP divergence: before_agent_start in OMP can only inject messages (return
-    // { message }), NOT mutate systemPrompt. We cache the prompt options + route
-    // snapshot here so before_provider_request can apply the 3-step pipeline to
-    // the provider payload. If OMP does not supply systemPromptOptions, skill
-    // compression and stable-prefix reorder are skipped (only churn strip runs).
     const eventRecord = asRecord(event);
-    pendingPromptOptions = (eventRecord?.systemPromptOptions as BuildSystemPromptOptions | undefined) ?? undefined;
-    pendingRouteSnapshot = routeSnapshot;
-    pendingRoutedModel = routedModel ?? _ctx.model;
-
+    const options = (eventRecord?.systemPromptOptions as BuildSystemPromptOptions | undefined) ?? undefined;
     const model = routedModel ?? _ctx.model;
+    const contextKey = makePromptRewriteContextKey(sessionHashFromContext(_ctx), model);
+    rememberPromptRewriteContext(promptRewriteContexts, contextKey, {
+      options,
+      routeSnapshot,
+      routedModel: model,
+      timestamp: Date.now(),
+    });
+
+    const modelForHint = model;
     const promptCacheKey = getSessionPromptCacheKey(_ctx);
     const cacheRetention = process.env[PI_CACHE_RETENTION_ENV] === LONG_CACHE_RETENTION_VALUE ? LONG_CACHE_RETENTION_VALUE : undefined;
     const rawSystemPrompt = typeof eventRecord?.systemPrompt === "string" ? eventRecord.systemPrompt : "";
@@ -5931,9 +5855,9 @@ export default function (pi: ExtensionAPI) {
       sessionIdHash: currentSessionHashSet ? currentSessionHash : sessionHashFromContext(_ctx),
       virtualProvider: routeSnapshot?.virtualProvider ?? _ctx.model?.provider,
       virtualModelId: routeSnapshot?.virtualModelId ?? _ctx.model?.id,
-      upstreamProvider: routeSnapshot?.provider ?? model?.provider,
-      upstreamModelId: routeSnapshot?.modelId ?? model?.id,
-      api: model?.api,
+      upstreamProvider: routeSnapshot?.provider ?? modelForHint?.provider,
+      upstreamModelId: routeSnapshot?.modelId ?? modelForHint?.id,
+      api: modelForHint?.api,
       systemPrompt: rawSystemPrompt,
       promptCacheKey,
       cacheRetention,
@@ -5961,21 +5885,24 @@ export default function (pi: ExtensionAPI) {
       requestModel &&
       !isResponsesPromptRewriteBypassApi(requestModel.api)
     ) {
+      const contextKey = makePromptRewriteContextKey(sessionHashFromContext(ctx), requestModel);
+      const rewriteContext = getPromptRewriteContext(promptRewriteContexts, contextKey);
+      const promptOptions = rewriteContext?.options;
       const original = extractSystemPrompt(resultPayload);
       if (original && original.trim().length > 0) {
         // Step 1: strip per-turn churn from <session-overview>.
         const stripped = stripSessionOverviewChurn(original);
 
         // Step 2: compress skills XML → one-line index (requires cached options).
-        const compressed = pendingPromptOptions
-          ? compressSkillsInSystemPrompt(stripped, pendingPromptOptions)
+        const compressed = promptOptions
+          ? compressSkillsInSystemPrompt(stripped, promptOptions)
           : stripped;
 
         // Step 3: lift stable content above dynamic content (requires cached options).
         let finalPrompt = compressed;
         let changed = false;
-        if (pendingPromptOptions) {
-          const optimized = optimizeSystemPrompt(compressed, pendingPromptOptions);
+        if (promptOptions) {
+          const optimized = optimizeSystemPrompt(compressed, promptOptions);
           if (optimized.changed && optimized.systemPrompt.trim().length > 0) {
             finalPrompt = optimized.systemPrompt;
             changed = true;
@@ -6020,9 +5947,9 @@ export default function (pi: ExtensionAPI) {
     if (warnedPromptCacheRetention400Models.has(key)) return;
     warnedPromptCacheRetention400Models.add(key);
     ctx.ui.notify(
-      `⚠️ ${LOG_PREFIX}: ${key} returned HTTP 400 while supportsLongPromptCacheRetention is enabled. ` +
+      `⚠️ ${LOG_PREFIX}：${key} 在启用 supportsLongPromptCacheRetention 时返回了 HTTP 400。` +
       getPromptCacheRetentionUnsupportedHint() +
-      ` Run /cache-optimizer doctor for the exact edit location.`,
+      ` 可运行 /cache-optimizer doctor 查看精确编辑位置。`,
       "warning",
     );
   });
@@ -6111,16 +6038,16 @@ export default function (pi: ExtensionAPI) {
         resetCurrentSessionStats();
         await flushPersistCacheStats(cmdCtx as unknown as ExtensionContext);
         await publishStatus(cmdCtx as unknown as ExtensionContext, model);
-        cmdCtx.ui.notify(`✅ OMP Cache Optimizer enabled for this OMP process. Current-session stats were reset for before/after comparison.\n${formatOptimizerRuntimeMode()}`, "info");
+        cmdCtx.ui.notify(`✅ 已为当前 OMP 进程开启缓存优化。已重置当前 session 统计，方便做前后对比。\n${formatOptimizerRuntimeMode()}`, "info");
       } else if (subcommand === "disable") {
         setRuntimeOptimizerEnabled(false);
         resetCurrentSessionStats();
         await flushPersistCacheStats(cmdCtx as unknown as ExtensionContext);
         await publishStatus(cmdCtx as unknown as ExtensionContext, model);
-        cmdCtx.ui.notify(`⏸️ OMP Cache Optimizer disabled for this OMP process. Current-session stats were reset and will keep collecting while disabled for comparison.\n${formatOptimizerRuntimeMode()}`, "warning");
+        cmdCtx.ui.notify(`⏸️ 已为当前 OMP 进程关闭缓存优化。已重置当前 session 统计，并会在关闭状态下继续采集用于对比。\n${formatOptimizerRuntimeMode()}`, "warning");
       } else if (subcommand === "doctor") {
         if (!model) {
-          cmdCtx.ui.notify("No active model selected. Select a model first with /model or omp --model.", "warning");
+          cmdCtx.ui.notify("当前没有活动模型。请先用 /model 或 omp --model 选择模型。", "warning");
           return;
         }
         const diagnosis = buildDoctorDiagnosis(model, { promptCacheRetention400: promptCacheRetention400Models.has(modelKey(model)) });
@@ -6135,7 +6062,7 @@ export default function (pi: ExtensionAPI) {
         cmdCtx.ui.notify(fullDiagnosis, "info");
       } else if (subcommand === "stats") {
         if (!model) {
-          cmdCtx.ui.notify("No active model selected. Select a model first with /model or omp --model.", "warning");
+          cmdCtx.ui.notify("当前没有活动模型。请先用 /model 或 omp --model 选择模型。", "warning");
           return;
         }
         const adapter = selectAdapterForModel(model);
@@ -6146,7 +6073,7 @@ export default function (pi: ExtensionAPI) {
         cmdCtx.ui.notify(output, "info");
       } else if (subcommand === "compat") {
         if (!model) {
-          cmdCtx.ui.notify("No active model selected. Select a model first with /model or omp --model.", "warning");
+          cmdCtx.ui.notify("当前没有活动模型。请先用 /model 或 omp --model 选择模型。", "warning");
           return;
         }
         const compatResult = buildCompatDiagnosis(model);
@@ -6155,19 +6082,19 @@ export default function (pi: ExtensionAPI) {
         } else {
           cmdCtx.ui.notify(
             isAdaptiveThinkingCompatApplicable(model) || isDeepSeekCompatCheckApplicable(model) || isCompatCheckApplicable(model)
-              ? "✅ Compat fully configured."
+              ? "✅ compat 配置完整。"
               : getCompatCheckNotApplicableLines(model).join("\n"),
             "info",
           );
         }
       } else if (subcommand === "reset") {
         if (!model) {
-          cmdCtx.ui.notify("No active model selected. Select a model first with /model or omp --model.", "warning");
+          cmdCtx.ui.notify("当前没有活动模型。请先用 /model 或 omp --model 选择模型。", "warning");
           return;
         }
         const adapter = selectAdapterForModel(model);
         if (!adapter) {
-          cmdCtx.ui.notify("ℹ️ Active model does not match a cache adapter. No stats to reset.", "info");
+          cmdCtx.ui.notify("ℹ️ 当前活动模型未匹配到缓存适配器，无需重置统计。", "info");
           return;
         }
 
@@ -6185,21 +6112,21 @@ export default function (pi: ExtensionAPI) {
         await publishStatus(cmdCtx as unknown as ExtensionContext, model);
 
         cmdCtx.ui.notify(
-          `✅ Reset local session cache stats for "${displayKey}". ` +
-          "Upstream provider prompt cache was not modified. " +
-          "New requests will start a fresh stats bucket for this OMP session.",
+          `✅ 已重置 "${displayKey}" 的本地 session 缓存统计。` +
+          "上游 provider 的 prompt cache 未被修改。" +
+          "后续请求会为当前 OMP session 开始新的统计桶。",
           "info",
         );
       } else if (subcommand === "fix") {
         if (!model) {
-          cmdCtx.ui.notify("No active model selected. Select a model first with /model or omp --model.", "warning");
+          cmdCtx.ui.notify("当前没有活动模型。请先用 /model 或 omp --model 选择模型。", "warning");
           return;
         }
 
         const suggestion = buildFixSuggestion(model);
         if (!suggestion) {
           const key = modelKey(model);
-          cmdCtx.ui.notify(`✅ Nothing to fix for "${key}". Compat already configured.`, "info");
+          cmdCtx.ui.notify(`✅ "${key}" 当前无需修复，compat 已配置完成。`, "info");
           return;
         }
 
@@ -6210,14 +6137,14 @@ export default function (pi: ExtensionAPI) {
         const compatResult = buildCompatDiagnosis(model);
         const yamlSnippet = formatCompatKeysForInsertion(suggestion.compatKeys);
         cmdCtx.ui.notify(
-          `📝 Manual fix for ${getModelsJsonDisplayPath()}:\n\n` +
-          `Provider: ${suggestion.providerLabel}\n` +
-          `Model: ${suggestion.modelId}\n\n` +
-          `Add these compat keys (model level, under the model entry):\n\n` +
+          `📝 ${getModelsJsonDisplayPath()} 的手动修复建议：\n\n` +
+          `提供方：${suggestion.providerLabel}\n` +
+          `模型：${suggestion.modelId}\n\n` +
+          `在模型级 compat（模型条目下）添加这些键：\n\n` +
           `compat:\n${yamlSnippet}\n\n` +
-          `Or at provider level (under providers["${suggestion.providerLabel}"]):\n\n` +
+          `或放到 provider 级（providers["${suggestion.providerLabel}"] 下）：\n\n` +
           `compat:\n${yamlSnippet}\n\n` +
-          `After editing, run /reload.\n` +
+          `编辑后运行 /reload。\n` +
           (compatResult ? `\n${compatResult}` : ""),
           "info",
         );
@@ -6225,31 +6152,31 @@ export default function (pi: ExtensionAPI) {
         // Try interactive selection menu when UI supports it
         if (cmdCtx.hasUI) {
           const menuOptions = [
-            "Enable — Turn on runtime optimizations",
-            "Disable — Turn off runtime optimizations",
-            "Doctor — Show cache configuration",
-            "Stats — Show cache stats and trend",
-            "Compat — Show compat suggestion",
-            "Fix — Auto-fix compat issues (writes models.yml)",
-            "Reset — Reset local session stats",
-            "Cancel",
+            "启用 —— 打开运行时优化",
+            "关闭 —— 关闭运行时优化",
+            "诊断 —— 查看缓存配置",
+            "统计 —— 查看缓存统计与趋势",
+            "兼容 —— 查看 compat 建议",
+            "修复 —— 查看 compat 修复建议（会写 models.yml 时另行提示）",
+            "重置 —— 重置本地 session 统计",
+            "取消",
           ];
-          const choice = await cmdCtx.ui.select("Cache Optimizer", menuOptions);
+          const choice = await cmdCtx.ui.select("缓存优化器", menuOptions);
           if (choice === menuOptions[0]) {
             setRuntimeOptimizerEnabled(true);
             resetCurrentSessionStats();
             await flushPersistCacheStats(cmdCtx as unknown as ExtensionContext);
             await publishStatus(cmdCtx as unknown as ExtensionContext, model);
-            cmdCtx.ui.notify(`✅ OMP Cache Optimizer enabled for this OMP process. Current-session stats were reset for before/after comparison.\n${formatOptimizerRuntimeMode()}`, "info");
+            cmdCtx.ui.notify(`✅ 已为当前 OMP 进程开启缓存优化。已重置当前 session 统计，方便做前后对比。\n${formatOptimizerRuntimeMode()}`, "info");
           } else if (choice === menuOptions[1]) {
             setRuntimeOptimizerEnabled(false);
             resetCurrentSessionStats();
             await flushPersistCacheStats(cmdCtx as unknown as ExtensionContext);
             await publishStatus(cmdCtx as unknown as ExtensionContext, model);
-            cmdCtx.ui.notify(`⏸️ OMP Cache Optimizer disabled for this OMP process. Current-session stats were reset and will keep collecting while disabled for comparison.\n${formatOptimizerRuntimeMode()}`, "warning");
+            cmdCtx.ui.notify(`⏸️ 已为当前 OMP 进程关闭缓存优化。已重置当前 session 统计，并会在关闭状态下继续采集用于对比。\n${formatOptimizerRuntimeMode()}`, "warning");
           } else if (choice === menuOptions[2]) {
             if (!model) {
-              cmdCtx.ui.notify("No active model selected. Select a model first with /model or omp --model.", "warning");
+              cmdCtx.ui.notify("当前没有活动模型。请先用 /model 或 omp --model 选择模型。", "warning");
             } else {
               const diagnosis = buildDoctorDiagnosis(model, { promptCacheRetention400: promptCacheRetention400Models.has(modelKey(model)) });
               const adapter = selectAdapterForModel(model);
@@ -6264,7 +6191,7 @@ export default function (pi: ExtensionAPI) {
             }
           } else if (choice === menuOptions[3]) {
             if (!model) {
-              cmdCtx.ui.notify("No active model selected. Select a model first with /model or omp --model.", "warning");
+              cmdCtx.ui.notify("当前没有活动模型。请先用 /model 或 omp --model 选择模型。", "warning");
             } else {
               const adapter = selectAdapterForModel(model);
               const sk = model ? sessionModelKey(model) : undefined;
@@ -6275,7 +6202,7 @@ export default function (pi: ExtensionAPI) {
             }
           } else if (choice === menuOptions[4]) {
             if (!model) {
-              cmdCtx.ui.notify("No active model selected. Select a model first with /model or omp --model.", "warning");
+              cmdCtx.ui.notify("当前没有活动模型。请先用 /model 或 omp --model 选择模型。", "warning");
             } else {
               const compatResult = buildCompatDiagnosis(model);
               if (compatResult) {
@@ -6283,7 +6210,7 @@ export default function (pi: ExtensionAPI) {
               } else {
                 cmdCtx.ui.notify(
                   isAdaptiveThinkingCompatApplicable(model) || isDeepSeekCompatCheckApplicable(model) || isCompatCheckApplicable(model)
-                    ? "✅ Compat fully configured."
+                    ? "✅ compat 配置完整。"
                     : getCompatCheckNotApplicableLines(model).join("\n"),
                   "info",
                 );
@@ -6292,13 +6219,13 @@ export default function (pi: ExtensionAPI) {
           } else if (choice === menuOptions[5]) {
             // Fix — auto-fix compat issues
             if (!model) {
-              cmdCtx.ui.notify("No active model selected. Select a model first with /model or omp --model.", "warning");
+              cmdCtx.ui.notify("当前没有活动模型。请先用 /model 或 omp --model 选择模型。", "warning");
               return;
             }
             const suggestion = buildFixSuggestion(model);
             if (!suggestion) {
               const key = modelKey(model);
-              cmdCtx.ui.notify(`✅ Nothing to fix for "${key}". Compat already configured.`, "info");
+              cmdCtx.ui.notify(`✅ "${key}" 当前无需修复，compat 已配置完成。`, "info");
               return;
             }
 
@@ -6306,30 +6233,30 @@ export default function (pi: ExtensionAPI) {
             const compatResult = buildCompatDiagnosis(model);
             const yamlSnippet = formatCompatKeysForInsertion(suggestion.compatKeys);
             cmdCtx.ui.notify(
-              `📝 Manual fix for ${getModelsJsonDisplayPath()}:\n\n` +
-              `Provider: ${suggestion.providerLabel}\n` +
-              `Model: ${suggestion.modelId}\n\n` +
-              `Add these compat keys:\n\n` +
+              `📝 ${getModelsJsonDisplayPath()} 的手动修复建议：\n\n` +
+              `提供方：${suggestion.providerLabel}\n` +
+              `模型：${suggestion.modelId}\n\n` +
+              `添加这些 compat 键：\n\n` +
               `compat:\n${yamlSnippet}\n\n` +
-              `After editing, run /reload.\n` +
+              `编辑后运行 /reload。\n` +
               (compatResult ? `\n${compatResult}` : ""),
               "info",
             );
           } else if (choice === menuOptions[6]) {
             if (!model) {
-              cmdCtx.ui.notify("No active model selected. Select a model first with /model or omp --model.", "warning");
+              cmdCtx.ui.notify("当前没有活动模型。请先用 /model 或 omp --model 选择模型。", "warning");
             } else {
               const adapter = selectAdapterForModel(model);
               if (!adapter) {
-                cmdCtx.ui.notify("ℹ️ Active model does not match a cache adapter. No stats to reset.", "info");
+                cmdCtx.ui.notify("ℹ️ 当前活动模型未匹配到缓存适配器，无需重置统计。", "info");
               } else {
                 const displayKey = modelKey(model);
                 resetStatsForModel(model);
                 await flushPersistCacheStats(cmdCtx as unknown as ExtensionContext);
                 await publishStatus(cmdCtx as unknown as ExtensionContext, model);
                 cmdCtx.ui.notify(
-                  `✅ Reset local session cache stats for "${displayKey}". ` +
-                  "Upstream provider prompt cache was not modified.",
+                  `✅ 已重置 "${displayKey}" 的本地 session 缓存统计。` +
+                  "上游 provider 的 prompt cache 未被修改。",
                   "info",
                 );
               }
@@ -6341,14 +6268,14 @@ export default function (pi: ExtensionAPI) {
 
         // Fallback: text help when no interactive UI
         const diagnosis: string[] = [];
-        diagnosis.push("📋 /cache-optimizer commands:");
-        diagnosis.push("  enable  — Enable prompt/cache optimizations for this OMP process");
-        diagnosis.push("  disable — Disable prompt/cache optimizations for this OMP process");
-        diagnosis.push("  doctor  — Show current model/provider/api/baseUrl/compat and low-hit diagnosis");
-        diagnosis.push("  stats   — Show active model stats bucket and recent trend");
-        diagnosis.push("  compat  — Show compat suggestion with edit location");
-        diagnosis.push("  fix     — Auto-fix compat issues (writes models.yml, requires UI)");
-        diagnosis.push("  reset   — Reset local session stats for current model (does not affect upstream)");
+        diagnosis.push("📋 /cache-optimizer 命令：");
+        diagnosis.push("  enable  —— 为当前 OMP 进程开启 prompt/cache 优化");
+        diagnosis.push("  disable —— 为当前 OMP 进程关闭 prompt/cache 优化");
+        diagnosis.push("  doctor  —— 查看当前模型/provider/api/baseUrl/compat 与低命中诊断");
+        diagnosis.push("  stats   —— 查看当前活动模型的统计桶与近期趋势");
+        diagnosis.push("  compat  —— 查看 compat 建议与编辑位置");
+        diagnosis.push("  fix     —— 查看 compat 修复建议（需要 UI 时另有提示）");
+        diagnosis.push("  reset   —— 重置当前模型的本地 session 统计（不影响上游）");
         diagnosis.push("");
         diagnosis.push(formatOptimizerRuntimeMode());
         diagnosis.push("");
@@ -6356,17 +6283,17 @@ export default function (pi: ExtensionAPI) {
           const displayKey = modelKey(model);
           const missing = describeMissingCacheCompatForModel(model);
           if (missing.length > 0) {
-            diagnosis.push(`⚠️  Active model "${displayKey}" missing compat: ${missing.join(", ")}`);
-            diagnosis.push('Run "/cache-optimizer compat" for edit instructions.');
+            diagnosis.push(`⚠️ 当前模型 "${displayKey}" 缺少 compat：${missing.join(", ")}`);
+            diagnosis.push('可运行 "/cache-optimizer compat" 查看编辑建议。');
           } else if (isAdaptiveThinkingCompatApplicable(model) || isDeepSeekCompatCheckApplicable(model) || isCompatCheckApplicable(model)) {
-            diagnosis.push(`✅ Active model "${displayKey}": compat fully configured.`);
+            diagnosis.push(`✅ 当前模型 "${displayKey}"：compat 配置完整。`);
           } else {
-            diagnosis.push(`ℹ️ Active model "${displayKey}": compat check not applicable.`);
+            diagnosis.push(`ℹ️ 当前模型 "${displayKey}"：不适用 compat 检查。`);
             const detailLines = getCompatCheckNotApplicableLines(model).slice(1);
             for (const line of detailLines) diagnosis.push(line);
           }
         } else {
-          diagnosis.push("No active model selected.");
+          diagnosis.push("当前没有活动模型。");
         }
         cmdCtx.ui.notify(diagnosis.join("\n"), "info");
       }
