@@ -281,6 +281,132 @@ expect(
   `Google 格式应提取 systemInstruction，实际: "${googlePrompt}"`,
 );
 
+
+const anthropicStructuredPayload = {
+  system: [
+    { type: "text", text: "Old Anthropic prompt.", cache_control: { type: "ephemeral" }, foo: "bar" },
+    { type: "image", source: { type: "base64", media_type: "image/png", data: "abc" } },
+  ],
+  messages: [],
+};
+const anthropicStructuredSet = setSystemPrompt(anthropicStructuredPayload, "New Anthropic prompt.");
+const anthropicStructuredFirst = asRecord(anthropicStructuredPayload.system[0]);
+expect(
+  "setSystemPrompt.anthropic-block-array-success",
+  anthropicStructuredSet === true,
+  "Anthropic block array 应成功写入",
+);
+expect(
+  "setSystemPrompt.anthropic-block-array-roundtrip",
+  extractSystemPrompt(anthropicStructuredPayload) === "New Anthropic prompt.",
+  `Anthropic block array 写入后应精确读回，实际: "${extractSystemPrompt(anthropicStructuredPayload)}"`,
+);
+expect(
+  "setSystemPrompt.anthropic-block-array-keeps-array",
+  Array.isArray(anthropicStructuredPayload.system) === true,
+  "Anthropic block array 写入后仍应是数组",
+);
+expect(
+  "setSystemPrompt.anthropic-block-array-keeps-metadata",
+  asRecord(anthropicStructuredFirst?.cache_control)?.type === "ephemeral" && anthropicStructuredFirst?.foo === "bar",
+  `Anthropic 文本块额外字段应保留，实际: ${JSON.stringify(anthropicStructuredFirst)}`,
+);
+expect(
+  "setSystemPrompt.anthropic-block-array-keeps-non-text",
+  asRecord(anthropicStructuredPayload.system[1])?.type === "image",
+  `Anthropic 非文本块应保留，实际: ${JSON.stringify(anthropicStructuredPayload.system)}`,
+);
+
+const googleStructuredPayload = {
+  systemInstruction: {
+    parts: [{ text: "Old Google prompt.", thought: true }, { inlineData: { mimeType: "image/png", data: "abc" } }],
+  },
+  contents: [],
+};
+const googleStructuredSet = setSystemPrompt(googleStructuredPayload, "New Google prompt.");
+const googleStructuredFirst = asRecord(googleStructuredPayload.systemInstruction.parts[0]);
+expect(
+  "setSystemPrompt.google-parts-array-success",
+  googleStructuredSet === true,
+  "Google parts array 应成功写入",
+);
+expect(
+  "setSystemPrompt.google-parts-array-roundtrip",
+  extractSystemPrompt(googleStructuredPayload) === "New Google prompt.",
+  `Google parts array 写入后应精确读回，实际: "${extractSystemPrompt(googleStructuredPayload)}"`,
+);
+expect(
+  "setSystemPrompt.google-parts-array-keeps-array",
+  Array.isArray(googleStructuredPayload.systemInstruction.parts) === true,
+  "Google parts 写入后仍应是数组",
+);
+expect(
+  "setSystemPrompt.google-parts-array-keeps-metadata",
+  googleStructuredFirst?.thought === true,
+  `Google 文本 part 额外字段应保留，实际: ${JSON.stringify(googleStructuredFirst)}`,
+);
+
+const openaiArrayPayload = {
+  messages: [
+    {
+      role: "developer",
+      content: [
+        { type: "text", text: "Old OpenAI prompt.", cache_control: { type: "ephemeral" } },
+        { type: "input_image", image_url: "data:image/png;base64,abc" },
+      ],
+    },
+    { role: "user", content: "Hello" },
+  ],
+};
+const openaiArraySet = setSystemPrompt(openaiArrayPayload, "New OpenAI prompt.");
+const openaiArrayContent = openaiArrayPayload.messages[0].content;
+expect(
+  "setSystemPrompt.openai-content-array-success",
+  openaiArraySet === true,
+  "OpenAI content array 应成功写入",
+);
+expect(
+  "setSystemPrompt.openai-content-array-keeps-array",
+  Array.isArray(openaiArrayContent) === true,
+  "OpenAI content array 写入后不能塌缩为字符串",
+);
+expect(
+  "setSystemPrompt.openai-content-array-roundtrip",
+  extractSystemPrompt(openaiArrayPayload) === "New OpenAI prompt.",
+  `OpenAI content array 写入后应精确读回，实际: "${extractSystemPrompt(openaiArrayPayload)}"`,
+);
+expect(
+  "setSystemPrompt.openai-content-array-keeps-non-text",
+  Array.isArray(openaiArrayContent) && asRecord(openaiArrayContent[1])?.type === "input_image",
+  `OpenAI content array 非文本项应保留，实际: ${JSON.stringify(openaiArrayContent)}`,
+);
+
+const collapsePayload = {
+  system: [
+    { type: "text", text: "First old prompt.", marker: "first" },
+    { type: "tool_result", id: "tool-1" },
+    { type: "text", text: "Second stale prompt.", marker: "second" },
+  ],
+  messages: [],
+};
+setSystemPrompt(collapsePayload, "Collapsed prompt.");
+expect(
+  "setSystemPrompt.block-array-collapses-extra-text",
+  collapsePayload.system.filter((item) => typeof asRecord(item)?.text === "string").length === 1,
+  `后续文本块应被丢弃，实际: ${JSON.stringify(collapsePayload.system)}`,
+);
+expect(
+  "setSystemPrompt.block-array-collapse-roundtrip",
+  extractSystemPrompt(collapsePayload) === "Collapsed prompt.",
+  `多文本块写入后应精确读回，实际: "${extractSystemPrompt(collapsePayload)}"`,
+);
+
+const emptyArrayPayload = { system: [] as unknown[], messages: [] };
+expect(
+  "setSystemPrompt.empty-array-remains-false",
+  setSystemPrompt(emptyArrayPayload, "Ignored prompt.") === false,
+  "空数组应保持写入失败语义",
+);
 // 无 system prompt 的 payload
 const noSystemPayload = { messages: [{ role: "user", content: "Hello" }] };
 expect(
