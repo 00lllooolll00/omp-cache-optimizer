@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { copyFile, mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import type { BuildSystemPromptOptions, ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
@@ -1028,7 +1028,7 @@ function getPromptRewriteContext(
  * for I/O — only for warning/doctor/README text so that users on any
  * platform see a copyable path they recognize.
  */
-function getModelsJsonDisplayPath(platform: string = process.platform): string {
+function getModelsYmlDisplayPath(platform: string = process.platform): string {
   if (platform.startsWith("win")) {
     return `%USERPROFILE%\\.omp\\agent\\models.yml`;
   }
@@ -1224,7 +1224,7 @@ function buildAdaptiveThinkingCompatWarningText(key: string, _missing: string[])
   const slashIdx = key.indexOf("/");
   const providerLabel = slashIdx > 0 ? key.slice(0, slashIdx) : key;
   const modelId = slashIdx > 0 ? key.slice(slashIdx + 1) : undefined;
-  const modelsJsonPath = getModelsJsonDisplayPath();
+  const modelsJsonPath = getModelsYmlDisplayPath();
   const lines: string[] = [
     `ℹ️ omp-cache-optimizer：${key} 是支持自适应生成的 Claude 模型。`,
     "OMP 内置 catalog 会自动处理自适应思考；官方模型不需要额外的 models.yml compat 键。",
@@ -1924,7 +1924,8 @@ function addOpenAIPromptCacheKey(payload: unknown, cacheKey: string | undefined)
     return undefined;
   }
 
-  return { ...record, prompt_cache_key: normalizedCacheKey };
+  record.prompt_cache_key = normalizedCacheKey;
+  return record;
 }
 
 // ── System prompt extraction/insertion for before_provider_request ──
@@ -2186,7 +2187,7 @@ function appendCredentialSafeProviderGuidance(lines: string[], placement: Compat
   lines.push("");
   lines.push("如果这个渠道在 models.yml 里还没有 provider 配置：");
   lines.push("- 保留现有认证方式；不要复制 credential、token 或 API key。");
-  lines.push(`- 只在 ${getModelsJsonDisplayPath()} 里添加缓存/路由 compat 覆盖。`);
+  lines.push(`- 只在 ${getModelsYmlDisplayPath()} 里添加缓存/路由 compat 覆盖。`);
 
   if (Object.keys(compatSuggestion).length === 0) {
     lines.push("- 上面这些缺失项目前没有安全可复制的 override。");
@@ -2241,7 +2242,7 @@ function buildOpenAIProxyCompatWarningText(key: string, missing: string[]): stri
   const providerLabel = slashIdx > 0 ? key.slice(0, slashIdx) : key;
   const modelId = slashIdx > 0 ? key.slice(slashIdx + 1) : undefined;
 
-  const modelsJsonPath = getModelsJsonDisplayPath();
+  const modelsJsonPath = getModelsYmlDisplayPath();
   const lines: string[] = [
     `💡 omp-cache-optimizer：${key} 是第三方 GPT/OpenAI 兼容代理，但合并后的 compat 缺少 ${missing.join(" 和 ")}。`,
     `编辑 ${modelsJsonPath} -> providers["${providerLabel}"] -> compat（与 baseUrl/api/apiKey/models 同级）。`,
@@ -2322,7 +2323,7 @@ function buildDeepSeekCompatWarningText(key: string, missing: string[]): string 
   const slashIdx = key.indexOf("/");
   const providerLabel = slashIdx > 0 ? key.slice(0, slashIdx) : key;
   const modelId = slashIdx > 0 ? key.slice(slashIdx + 1) : undefined;
-  const modelsJsonPath = getModelsJsonDisplayPath();
+  const modelsJsonPath = getModelsYmlDisplayPath();
   const lines: string[] = [
     `💡 omp-cache-optimizer：${key} 看起来是 DeepSeek 风格模型，但合并后的 compat 缺少 ${missing.join(" 和 ")}。`,
     `这可能让代理降低或隐藏缓存命中。编辑 ${modelsJsonPath} -> providers["${providerLabel}"] -> compat（与 baseUrl/api/apiKey/models 同级）。`,
@@ -4075,7 +4076,7 @@ function buildDoctorDiagnosis(model: PiModel, options: { promptCacheRetention400
     const key = modelKey(model);
     const slashIdx = key.indexOf("/");
     const providerLabel = slashIdx > 0 ? key.slice(0, slashIdx) : key;
-    const modelsJsonPath = getModelsJsonDisplayPath();
+    const modelsJsonPath = getModelsYmlDisplayPath();
     lines.push(`编辑 ${modelsJsonPath} -> providers["${providerLabel}"] -> compat（与 baseUrl/api/apiKey/models 同级）。`);
     if (adaptiveThinkingApplicable) {
       appendAdaptiveThinkingCompatAdviceLines(lines, missing, { providerLabel, modelId: model.id });
@@ -4229,7 +4230,7 @@ function buildCompatDiagnosis(model: PiModel): string | undefined {
   if (missing.length > 0) {
     const slashIdx = key.indexOf("/");
     const providerLabel = slashIdx > 0 ? key.slice(0, slashIdx) : key;
-    const modelsJsonPath = getModelsJsonDisplayPath();
+    const modelsJsonPath = getModelsYmlDisplayPath();
     lines.push(`当前模型：${key}`);
     if (safeFixableMissingC.length > 0) {
       lines.push(`可安全修复：${safeFixableMissingC.join(", ")}`);
@@ -4274,171 +4275,11 @@ function buildCompatDiagnosis(model: PiModel): string | undefined {
 }
 
 // ============================================================
-// JSONC comment-preserving surgical edit helpers for /cache-optimizer fix
+// Manual YAML compat suggestions for /cache-optimizer fix
 // ============================================================
 
 /** The real models.yml path used for I/O. OMP stores model config as YAML, not JSONC. */
-const MODELS_JSON_PATH = join(STATE_DIR, "models.yml");
-
-// ── String-aware JSONC scanning primitives ─────────────────────────
-//
-// These operate on comment-stripped text produced by stripJsoncComments()
-// (which preserves byte offsets), so every offset they return is also valid
-// in the original text. All scanning skips string literals, so braces or
-// brackets inside string values (e.g. apiKeyCommand shell snippets) cannot
-// corrupt depth tracking.
-
-
-function isJsonWhitespace(ch: string): boolean {
-  return ch === " " || ch === "\n" || ch === "\r" || ch === "\t";
-}
-
-function skipJsonWhitespace(text: string, pos: number): number {
-  while (pos < text.length && isJsonWhitespace(text[pos])) pos++;
-  return pos;
-}
-/**
- * Read a JSON string literal starting at `pos` (which must be `"`).
- * Returns the decoded value and the offset just past the closing quote,
- * or undefined when the literal is unterminated/malformed.
- */
-function readJsonStringLiteral(text: string, pos: number): { value: string; end: number } | undefined {
-  if (text[pos] !== '"') return undefined;
-  let i = pos + 1;
-  let value = "";
-  while (i < text.length) {
-    const ch = text[i];
-    if (ch === "\\") {
-      const next = text[i + 1];
-      if (next === undefined) return undefined;
-      if (next === "u") {
-        const hex = text.slice(i + 2, i + 6);
-        if (!/^[0-9a-fA-F]{4}$/.test(hex)) return undefined;
-        value += String.fromCharCode(parseInt(hex, 16));
-        i += 6;
-      } else {
-        if (next === "n") value += "\n";
-        else if (next === "t") value += "\t";
-        else if (next === "r") value += "\r";
-        else if (next === "b") value += "\b";
-        else if (next === "f") value += "\f";
-        else value += next; // ", \\, / and lenient passthrough
-        i += 2;
-      }
-      continue;
-    }
-    if (ch === '"') return { value, end: i + 1 };
-    value += ch;
-    i++;
-  }
-  return undefined;
-}
-
-/**
- * Find the offset of the `}` / `]` matching the opener at `openPos`,
- * skipping string literals. Returns undefined on imbalance.
- */
-function findMatchingBracket(text: string, openPos: number): number | undefined {
-  const open = text[openPos];
-  if (open !== "{" && open !== "[") return undefined;
-  let depth = 0;
-  let i = openPos;
-  while (i < text.length) {
-    const ch = text[i];
-    if (ch === '"') {
-      const str = readJsonStringLiteral(text, i);
-      if (!str) return undefined;
-      i = str.end;
-      continue;
-    }
-    if (ch === "{" || ch === "[") depth++;
-    else if (ch === "}" || ch === "]") {
-      depth--;
-      if (depth === 0) return i;
-    }
-    i++;
-  }
-  return undefined;
-}
-
-/** Skip one JSON value starting at/after `pos`; returns the offset just past it. */
-function skipJsonValue(text: string, pos: number): number | undefined {
-  pos = skipJsonWhitespace(text, pos);
-  const ch = text[pos];
-  if (ch === '"') {
-    const str = readJsonStringLiteral(text, pos);
-    return str?.end;
-  }
-  if (ch === "{" || ch === "[") {
-    const end = findMatchingBracket(text, pos);
-    return end === undefined ? undefined : end + 1;
-  }
-  let i = pos;
-  while (i < text.length && !",}]".includes(text[i]) && !isJsonWhitespace(text[i])) i++;
-  return i > pos ? i : undefined;
-}
-
-/**
- * Find a top-level key in the object whose `{` is at `openBracePos`.
- * Only direct children are considered (nested values are skipped whole).
- * Returns the key's opening-quote offset and its value's start offset,
- * or undefined when the key is absent or the object is malformed.
- */
-function findJsonObjectKey(
-  text: string,
-  openBracePos: number,
-  targetKey: string,
-): { keyStart: number; valueStart: number } | undefined {
-  if (text[openBracePos] !== "{") return undefined;
-  let i = openBracePos + 1;
-  while (i < text.length) {
-    i = skipJsonWhitespace(text, i);
-    if (i >= text.length || text[i] === "}") return undefined;
-    if (text[i] === ",") {
-      i++;
-      continue;
-    }
-    if (text[i] !== '"') return undefined; // unexpected token — refuse to guess
-    const keyStart = i;
-    const key = readJsonStringLiteral(text, i);
-    if (!key) return undefined;
-    i = skipJsonWhitespace(text, key.end);
-    if (text[i] !== ":") return undefined;
-    i = skipJsonWhitespace(text, i + 1);
-    if (key.value === targetKey) return { keyStart, valueStart: i };
-    const after = skipJsonValue(text, i);
-    if (after === undefined) return undefined;
-    i = after;
-  }
-  return undefined;
-}
-
-/** Leading whitespace of the line containing offset `pos` (up to `pos`). */
-function lineIndentOf(text: string, pos: number): string {
-  let lineStart = text.lastIndexOf("\n", pos - 1);
-  lineStart = lineStart < 0 ? 0 : lineStart + 1;
-  const m = text.slice(lineStart, pos).match(/^[ \t]*/);
-  return m ? m[0] : "";
-}
-
-/**
- * Indentation used by the first line inside the object spanning
- * `openBrace`..`closeBrace` in the ORIGINAL text. Falls back to the
- * opener's line indent plus two spaces for single-line objects.
- */
-function deriveInnerIndent(text: string, openBrace: number, closeBrace: number): string {
-  const nl = text.indexOf("\n", openBrace + 1);
-  if (nl >= 0 && nl < closeBrace) {
-    let i = nl + 1;
-    let ws = "";
-    while (i < text.length && (text[i] === " " || text[i] === "\t")) {
-      ws += text[i];
-      i++;
-    }
-    if (ws.length > 0) return ws;
-  }
-  return lineIndentOf(text, openBrace) + "  ";
-}
+const MODELS_YML_PATH = join(STATE_DIR, "models.yml");
 
 interface FixSuggestion {
   providerLabel: string;
@@ -4478,676 +4319,7 @@ function buildFixSuggestion(model: PiModel): FixSuggestion | undefined {
 }
 
 /**
- * Strip JSONC comments from text, replacing them with spaces.
- * Handles string literals, escaped quotes, // line comments, /* block comments *\/.
- * Returns the cleaned text with same line/column positions.
- */
-function stripJsoncComments(text: string): string {
-  const out: string[] = [];
-  let i = 0;
-  while (i < text.length) {
-    const ch = text[i];
-
-    if (ch === '"') {
-      // String literal — copy byte-for-byte until the closing quote.
-      // Escaped quotes/slashes must not be mistaken for comment delimiters.
-      out.push(ch);
-      i++;
-      while (i < text.length) {
-        const sc = text[i];
-        out.push(sc);
-        i++;
-        if (sc === '\\' && i < text.length) {
-          out.push(text[i]);
-          i++;
-        } else if (sc === '"') {
-          break;
-        }
-      }
-      continue;
-    }
-
-    if (ch === '/' && i + 1 < text.length && text[i + 1] === '/') {
-      // Line comment — replace BOTH slashes and every comment byte with
-      // spaces, but leave the newline to be copied by the normal path.
-      out.push(' ', ' ');
-      i += 2;
-      while (i < text.length && text[i] !== '\n') {
-        out.push(' ');
-        i++;
-      }
-      continue;
-    }
-
-    if (ch === '/' && i + 1 < text.length && text[i + 1] === '*') {
-      // Block comment — replace every byte with a space except newlines.
-      // This deliberately preserves text.length and all structural offsets.
-      out.push(' ', ' ');
-      i += 2;
-      while (i < text.length) {
-        if (text[i] === '*' && i + 1 < text.length && text[i + 1] === '/') {
-          out.push(' ', ' ');
-          i += 2;
-          break;
-        }
-        out.push(text[i] === '\n' ? '\n' : ' ');
-        i++;
-      }
-      continue;
-    }
-
-    out.push(ch);
-    i++;
-  }
-  return out.join('');
-}
-
-/**
- * Remove JSONC trailing commas from already comment-stripped text.
- * The returned text stays length-preserving (commas become spaces), which
- * gives JSON.parse a tolerant JSONC surface without affecting diagnostics.
- */
-function stripJsoncTrailingCommas(text: string): string {
-  const chars = text.split("");
-  let i = 0;
-  while (i < chars.length) {
-    if (chars[i] === '"') {
-      const str = readJsonStringLiteral(text, i);
-      if (!str) break;
-      i = str.end;
-      continue;
-    }
-
-    if (chars[i] === ',') {
-      let j = i + 1;
-      while (j < chars.length && isJsonWhitespace(chars[j])) j++;
-      if (chars[j] === '}' || chars[j] === ']') chars[i] = ' ';
-    }
-    i++;
-  }
-  return chars.join('');
-}
-
-function parseJsonc(text: string): unknown {
-  return JSON.parse(stripJsoncTrailingCommas(stripJsoncComments(text)));
-}
-
-/**
- * YAML scanner: locate the provider block and model entry in models.yml text.
- * Returns the byte offsets for surgical insertion, or undefined if ambiguous.
- */
-interface ModelNodeLocation {
-  /** Offset of the model object's opening `{` */
-  modelObjectBrace: number;
-  /** Offset of the model object's closing `}` */
-  modelObjectEnd: number;
-  /** Offset of the "compat" key start (the `"`), or -1 if compat doesn't exist */
-  compatKeyStart: number;
-  /** Offset of the compat object's opening `{`, or -1 if compat doesn't exist */
-  compatObjectBrace: number;
-  /** Offset of the compat object's closing `}`, or -1 */
-  compatObjectEnd: number;
-  /** Indentation string to use for inserted lines (derived from surrounding context) */
-  indent: string;
-  /** Offset of the provider object's opening `{` */
-  providerObjectBrace: number;
-  /** Offset of the provider object's closing `}` */
-  providerObjectEnd: number;
-  /** Offset of the provider-level compat object's opening `{`, or -1 if absent */
-  providerCompatBrace: number;
-  /** Offset of the provider-level compat object's closing `}`, or -1 if absent */
-  providerCompatEnd: number;
-  /** All model ids found in this provider's models array (for placement safety analysis) */
-  allModelIds: string[];
-}
-
-/**
- * Locate the provider + model entry in raw JSONC text.
- * Returns the positions needed for surgical insertion, or undefined on failure.
- *
- * This is a scan-only pass — no AST build, no regex reliance.
- */
-function locateModelInJsonc(
-  text: string,
-  providerLabel: string,
-  modelId: string,
-): ModelNodeLocation | undefined {
-  // Clean text of comments first for reliable structural scanning
-  const clean = stripJsoncComments(text);
-
-  // Strategy: find `"providers"` as a direct root key, then find the
-  // provider key under it, then the provider's direct `"models"` key.
-  // All object/value traversal uses the string-aware primitives above so
-  // braces, brackets, comment markers, or escaped quotes inside strings do
-  // not corrupt offsets.
-  const rootBrace = skipJsonWhitespace(clean, 0);
-  if (clean[rootBrace] !== "{") return undefined;
-
-  const providersKey = findJsonObjectKey(clean, rootBrace, "providers");
-  if (!providersKey) return undefined;
-  const providersBrace = skipJsonWhitespace(clean, providersKey.valueStart);
-  if (clean[providersBrace] !== "{") return undefined;
-  const providersEnd = findMatchingBracket(clean, providersBrace);
-  if (providersEnd === undefined) return undefined;
-
-  const providerKey = findJsonObjectKey(clean, providersBrace, providerLabel);
-  if (!providerKey || providerKey.keyStart > providersEnd) return undefined;
-  const providerBrace = skipJsonWhitespace(clean, providerKey.valueStart);
-  if (clean[providerBrace] !== "{") return undefined;
-  const providerEndBrace = findMatchingBracket(clean, providerBrace);
-  if (providerEndBrace === undefined || providerEndBrace > providersEnd) return undefined;
-
-  // Provider-level compat is a direct provider child only. Nested model
-  // compat objects are intentionally skipped whole by findJsonObjectKey.
-  let providerCompatBrace = -1;
-  let providerCompatEnd = -1;
-  const providerCompatKey = findJsonObjectKey(clean, providerBrace, "compat");
-  if (providerCompatKey && providerCompatKey.keyStart < providerEndBrace) {
-    const brace = skipJsonWhitespace(clean, providerCompatKey.valueStart);
-    if (clean[brace] === "{") {
-      const end = findMatchingBracket(clean, brace);
-      if (end !== undefined && end <= providerEndBrace) {
-        providerCompatBrace = brace;
-        providerCompatEnd = end;
-      }
-    }
-  }
-
-  const modelsKey = findJsonObjectKey(clean, providerBrace, "models");
-  if (!modelsKey || modelsKey.keyStart > providerEndBrace) return undefined;
-
-  let modelsScan = skipJsonWhitespace(clean, modelsKey.valueStart);
-  if (clean[modelsScan] !== "[") return undefined;
-  const modelsEnd = findMatchingBracket(clean, modelsScan);
-  if (modelsEnd === undefined || modelsEnd > providerEndBrace) return undefined;
-  modelsScan++; // Skip `[`
-
-  // Scan ALL array elements: collect every model id, and record the target's position
-  const allModelIds: string[] = [];
-  let modelBrace = -1;
-  let modelEndBrace = -1;
-  let compatKeyStartClean = -1;
-  let compatBrace = -1;
-  let compatEndBrace = -1;
-
-  while (modelsScan < modelsEnd) {
-    modelsScan = skipJsonWhitespace(clean, modelsScan);
-    if (clean[modelsScan] === ',') {
-      modelsScan++;
-      continue;
-    }
-    if (modelsScan >= modelsEnd || clean[modelsScan] === ']') break;
-    if (clean[modelsScan] !== '{') return undefined;
-
-    const elementBrace = modelsScan;
-    const elementEnd = findMatchingBracket(clean, elementBrace);
-    if (elementEnd === undefined || elementEnd > modelsEnd) return undefined;
-
-    const idKey = findJsonObjectKey(clean, elementBrace, "id");
-    let elementId: string | undefined;
-    if (idKey && idKey.keyStart < elementEnd) {
-      const idValueStart = skipJsonWhitespace(clean, idKey.valueStart);
-      const idLiteral = readJsonStringLiteral(clean, idValueStart);
-      if (idLiteral && idLiteral.end <= elementEnd) {
-        elementId = idLiteral.value;
-      }
-    }
-
-    if (elementId !== undefined) {
-      allModelIds.push(elementId);
-    }
-
-    if (elementId === modelId && modelBrace < 0) {
-      modelBrace = elementBrace;
-      modelEndBrace = elementEnd;
-
-      const compatKey = findJsonObjectKey(clean, modelBrace, "compat");
-      if (compatKey && compatKey.keyStart < modelEndBrace) {
-        compatKeyStartClean = compatKey.keyStart;
-        const brace = skipJsonWhitespace(clean, compatKey.valueStart);
-        if (clean[brace] === "{") {
-          const end = findMatchingBracket(clean, brace);
-          if (end !== undefined && end <= modelEndBrace) {
-            compatBrace = brace;
-            compatEndBrace = end;
-          }
-        }
-      }
-    }
-
-    modelsScan = elementEnd + 1;
-  }
-
-  if (modelBrace < 0 || modelEndBrace < 0) return undefined;
-
-  // Derive indentation from the model object's opening `{` line in original text
-  // Look backwards to find the line start
-  let lineStart = text.lastIndexOf('\n', modelBrace);
-  if (lineStart < 0) lineStart = 0;
-  const lineBefore = text.slice(lineStart, modelBrace);
-  const indentMatch = lineBefore.match(/^(\s*)/);
-  const baseIndent = indentMatch ? indentMatch[1] : '  ';
-  const indent = baseIndent + '  '; // +2 for one level deeper
-
-  return {
-    modelObjectBrace: modelBrace,
-    modelObjectEnd: modelEndBrace,
-    compatKeyStart: compatKeyStartClean >= 0 ? compatKeyStartClean : -1,
-    compatObjectBrace: compatBrace,
-    compatObjectEnd: compatEndBrace,
-    indent,
-    providerObjectBrace: providerBrace,
-    providerObjectEnd: providerEndBrace,
-    providerCompatBrace,
-    providerCompatEnd,
-    allModelIds,
-  };
-}
-
-/**
- * Deep-equal comparison of two values, used for post-write self-check.
- * Compares all keys recursively, allowing `extraKeys` to be present in `a` but not in `b`.
- */
-function deepEqualIgnoringKeys(a: unknown, b: unknown, extraKeys: string[]): boolean {
-  if (a === b) return true;
-  if (typeof a !== typeof b) return false;
-  if (Array.isArray(a) && Array.isArray(b)) {
-    if (a.length !== b.length) return false;
-    for (let i = 0; i < a.length; i++) {
-      if (!deepEqualIgnoringKeys(a[i], b[i], extraKeys)) return false;
-    }
-    return true;
-  }
-  if (typeof a === 'object' && a !== null && typeof b === 'object' && b !== null) {
-    const aKeys = Object.keys(a as Record<string, unknown>).filter(k => !extraKeys.includes(k));
-    const bKeys = Object.keys(b as Record<string, unknown>);
-    if (aKeys.length !== bKeys.length) return false;
-    for (const k of aKeys) {
-      if (!(k in (b as Record<string, unknown>))) return false;
-      if (!deepEqualIgnoringKeys(
-        (a as Record<string, unknown>)[k],
-        (b as Record<string, unknown>)[k],
-        extraKeys,
-      )) return false;
-    }
-    return true;
-  }
-  return false;
-}
-
-/**
- * Compose the fix: produce the modified text with compat keys inserted.
- *
- * Strategy:
- * - If compat object exists: replace its interior (between `{` and `}`)
- *   with new keys + existing content, preserving surrounding bytes.
- * - If compat doesn't exist: insert `"compat": { keys }` after model `{`.
- *
- * Uses the raw original text; only the inserted/compat region changes.
- */
-/**
- * Compat keys that describe CHANNEL capabilities (routing, endpoint features).
- * These are always safe at the provider level because they do not change
- * per-model request semantics.
- */
-// OMP divergence: only supportsLongPromptCacheRetention remains as a provider-safe
-// compat key. Session affinity (sendSessionAffinityHeaders/sendSessionIdHeader) is
-// gone (OMP uses multi-credential auth), and forceAdaptiveThinking is catalog-driven.
-const PROVIDER_LEVEL_SAFE_COMPAT_KEYS = new Set<string>([
-  "supportsLongPromptCacheRetention",
-]);
-
-function syntheticModelForId(providerLabel: string, id: string): PiModel {
-  return { provider: providerLabel, id, name: id } as PiModel;
-}
-
-/**
- * Decide whether the fix should write provider-level or model-level compat.
- *
- * Strategy (auto-detect, prefer provider level when safe):
- * - Channel-capability keys (session affinity / long retention) are always
- *   provider-safe.
- * - Model-behavior keys (forceAdaptiveThinking, thinkingFormat, ...) are
- *   provider-safe ONLY when every sibling model in the provider also matches
- *   the same detection (all adaptive-generation / all DeepSeek-like).
- * - Single-model providers: provider level is equivalent — prefer it.
- * - Any unsafe key → fall back to model level (single write, smallest blast radius).
- */
-function decideFixPlacement(
-  compatKeys: Record<string, unknown>,
-  providerLabel: string,
-  allModelIds: string[],
-): { placement: "provider" | "model"; reason: string } {
-  const siblings = allModelIds.filter(Boolean);
-
-  if (siblings.length <= 1) {
-    return {
-      placement: "provider",
-      reason: "this provider has only one model — provider-level compat is equivalent and easier to maintain",
-    };
-  }
-
-  const unsafeKeys: string[] = [];
-  for (const key of Object.keys(compatKeys)) {
-    if (PROVIDER_LEVEL_SAFE_COMPAT_KEYS.has(key)) continue;
-
-    // OMP divergence: forceAdaptiveThinking removed (catalog-driven).
-    // requiresReasoningContentForToolCalls renamed from requiresReasoningContentOnAssistantMessages.
-    if (key === "requiresReasoningContentForToolCalls") {
-      const allDeepSeek = siblings.every((id) => isDeepSeekLikeModel(syntheticModelForId(providerLabel, id)));
-      if (!allDeepSeek) unsafeKeys.push(key);
-      continue;
-    }
-    // Unknown model-behavior key — be conservative, keep it model-scoped.
-    unsafeKeys.push(key);
-  }
-
-  if (unsafeKeys.length === 0) {
-    return {
-      placement: "provider",
-      reason: `all ${siblings.length} models in this provider are compatible with these flags`,
-    };
-  }
-  return {
-    placement: "model",
-    reason: `${unsafeKeys.join(", ")} could break sibling models in this provider (${siblings.length} models total) — scoping to this model only`,
-  };
-}
-
-function findExistingCompatKeysInJsonc(
-  original: string,
-  compatBrace: number,
-  compatEnd: number,
-  keys: string[],
-): string[] {
-  if (compatBrace < 0 || compatEnd <= compatBrace) return [];
-  const clean = stripJsoncComments(original);
-  return keys.filter((key) => {
-    const found = findJsonObjectKey(clean, compatBrace, key);
-    return !!found && found.keyStart < compatEnd;
-  });
-}
-
-function chooseFixPlacement(
-  original: string,
-  location: ModelNodeLocation,
-  compatKeys: Record<string, unknown>,
-  providerLabel: string,
-): { placement: "provider" | "model"; reason: string } {
-  const decision = decideFixPlacement(compatKeys, providerLabel, location.allModelIds);
-  const existingModelKeys = findExistingCompatKeysInJsonc(
-    original,
-    location.compatObjectBrace,
-    location.compatObjectEnd,
-    Object.keys(compatKeys),
-  );
-
-  // Provider-level writes cannot override a model-level compat key because the runtime's
-  // merge order is provider.compat then model.compat. If the active model already
-  // has one of the keys we need to repair (e.g. thinkingFormat: \"legacy\"), write
-  // at model level even when the key would otherwise be provider-safe.
-  if (decision.placement === "provider" && existingModelKeys.length > 0) {
-    return {
-      placement: "model",
-      reason: `model-level compat already contains ${existingModelKeys.join(", ")} — repairing the active model override directly`,
-    };
-  }
-
-  return decision;
-}
-
-function composeFixInsertion(
-  original: string,
-  location: ModelNodeLocation,
-  compatKeys: Record<string, unknown>,
-  placement: "provider" | "model" = "model",
-): string {
-  // Resolve the target compat object and its container based on placement.
-  const targetCompatBrace = placement === "provider" ? location.providerCompatBrace : location.compatObjectBrace;
-  const targetCompatEnd = placement === "provider" ? location.providerCompatEnd : location.compatObjectEnd;
-  const containerBrace = placement === "provider" ? location.providerObjectBrace : location.modelObjectBrace;
-
-  // Helper: format key/value pairs as lines with the given indent,
-  // alphabetically sorted for stable previews and deterministic edits.
-  const sortedEntries = Object.entries(compatKeys).sort(([a], [b]) => a.localeCompare(b));
-  const formatEntries = (indent: string, entries: Array<[string, unknown]>): string =>
-    entries
-      .map(([k, v]) => `${indent}${JSON.stringify(k)}: ${JSON.stringify(v)}`)
-      .join(',\n');
-
-  // Helper: line-start indentation of the line containing `offset` in `original`.
-  const lineIndentAt = (offset: number): string => {
-    let ls = original.lastIndexOf('\n', offset);
-    if (ls < 0) ls = -1;
-    const line = original.slice(ls + 1, offset);
-    const m = line.match(/^(\s*)/);
-    return m ? m[1] : '';
-  };
-
-  if (targetCompatBrace >= 0 && targetCompatEnd > targetCompatBrace) {
-    // ── Existing compat object: insert absent keys and surgically replace
-    // direct existing keys whose value is wrong (e.g. thinkingFormat: "legacy").
-    // Unrelated interior bytes/comments/key order are preserved.
-    const interiorStart = targetCompatBrace + 1;
-    const interior = original.slice(interiorStart, targetCompatEnd);
-    const hasContent = interior.trim().length > 0;
-    const clean = stripJsoncComments(original);
-
-    // Indent for inserted key lines: copy the first existing key line's indent,
-    // else derive one level deeper than the compat brace's own line.
-    const braceLineIndent = lineIndentAt(targetCompatBrace);
-    const innerMatch = interior.match(/\r?\n([ \t]+)\S/);
-    const innerIndent = innerMatch ? innerMatch[1] : braceLineIndent + '  ';
-
-    const edits: Array<{ start: number; end: number; text: string }> = [];
-    const missingEntries: Array<[string, unknown]> = [];
-
-    for (const [key, value] of sortedEntries) {
-      const existing = findJsonObjectKey(clean, targetCompatBrace, key);
-      if (existing && existing.keyStart < targetCompatEnd) {
-        const valueStart = skipJsonWhitespace(clean, existing.valueStart);
-        const valueEnd = skipJsonValue(clean, valueStart);
-        if (valueEnd !== undefined && valueEnd <= targetCompatEnd) {
-          const nextValue = JSON.stringify(value);
-          if (original.slice(valueStart, valueEnd) !== nextValue) {
-            edits.push({ start: valueStart, end: valueEnd, text: nextValue });
-          }
-          continue;
-        }
-      }
-      missingEntries.push([key, value]);
-    }
-
-    if (missingEntries.length > 0) {
-      const keysFormatted = formatEntries(innerIndent, missingEntries);
-      if (hasContent) {
-        edits.push({ start: interiorStart, end: interiorStart, text: `\n${keysFormatted},` });
-      } else {
-        edits.push({ start: interiorStart, end: targetCompatEnd, text: `\n${keysFormatted}\n${braceLineIndent}` });
-      }
-    }
-
-    // Apply later edits first so earlier offsets remain valid.
-    return edits
-      .sort((a, b) => b.start - a.start)
-      .reduce((text, edit) => text.slice(0, edit.start) + edit.text + text.slice(edit.end), original);
-  }
-
-  // ── No compat object yet: create one right after the container `{`. ──
-  // Everything after the brace (including the next line's indentation) is
-  // preserved byte-for-byte; we only prepend a complete `"compat": {...},` block.
-  const afterBrace = containerBrace + 1;
-  const suffix = original.slice(afterBrace);
-
-  // Key indent: copy the first sibling key line's indent from the suffix,
-  // else one level deeper than the container brace's line.
-  const containerLineIndent = lineIndentAt(containerBrace);
-  const siblingMatch = suffix.match(/^\r?\n([ \t]+)\S/);
-  const keyIndent = siblingMatch ? siblingMatch[1] : containerLineIndent + '  ';
-
-  // One more level for keys inside compat: reuse the file's own indent unit.
-  const unit = keyIndent.startsWith(containerLineIndent) && keyIndent.length > containerLineIndent.length
-    ? keyIndent.slice(containerLineIndent.length)
-    : '  ';
-  const innerIndent = keyIndent + unit;
-
-  const compatBlock = `\n${keyIndent}"compat": {\n${formatEntries(innerIndent, sortedEntries)}\n${keyIndent}},`;
-  return original.slice(0, afterBrace) + compatBlock + suffix;
-}
-
-/**
- * Self-check after compose: parse original and modified as JSONC,
- * assert target compat flags exist in the right path, and remaining structure
- * is deep-equal (ignoring the inserted keys).
- * Returns null on success, error message on failure.
- */
-function selfCheckFix(
-  original: string,
-  modified: string,
-  providerLabel: string,
-  modelId: string,
-  compatKeys: Record<string, unknown>,
-): string | null {
-  try {
-    // Step 1: Parse both versions as JSONC (comments + trailing commas allowed).
-    const origParsed = parseJsonc(original);
-    const modParsed = parseJsonc(modified);
-
-    // Step 2: Validate modified file has correct structure
-    const providers = asRecord(asRecord(modParsed)?.providers);
-    if (!providers) {
-      return "Modified file: providers object missing or invalid";
-    }
-    const provider = asRecord(providers[providerLabel]);
-    if (!provider) {
-      return `Modified file: provider "${providerLabel}" not found`;
-    }
-
-    // Step 3: Validate models array structure
-    const models = provider.models;
-    if (!Array.isArray(models)) {
-      return `Modified file: provider "${providerLabel}".models is not an array`;
-    }
-    if (models.length === 0) {
-      return `Modified file: provider "${providerLabel}".models is empty`;
-    }
-    
-    // Step 4: Find and validate target model
-    const targetModel = models.find((m: Record<string, unknown>) => m.id === modelId);
-    if (!targetModel || typeof targetModel !== 'object') {
-      return `Modified file: model "${modelId}" not found in provider`;
-    }
-
-    // Locate the corresponding original provider/model objects. The structure
-    // preservation check below may allow repaired compat values to differ, but
-    // only on these exact target/provider compat objects — never on siblings.
-    const origProviders = asRecord(asRecord(origParsed)?.providers);
-    const origProvider = asRecord(origProviders?.[providerLabel]);
-    const origModels = Array.isArray(origProvider?.models) ? origProvider.models : undefined;
-    const origTargetModel = origModels?.find((m: unknown) => asRecord(m)?.id === modelId);
-    const origTargetModelRecord = asRecord(origTargetModel);
-    if (!origProvider || !origTargetModelRecord) {
-      return `Original file: provider/model "${providerLabel}/${modelId}" not found`;
-    }
-    
-    // Step 5: Compute the EFFECTIVE merged compat (provider-level + model-level),
-    // mirroring the runtime's mergeCompat behavior (model wins on conflicts). The fix may
-    // have written either level, so validation must check the merged result.
-    const provCompatRaw = (provider as Record<string, unknown>).compat;
-    const provCompat = (provCompatRaw && typeof provCompatRaw === 'object' && !Array.isArray(provCompatRaw))
-      ? provCompatRaw as Record<string, unknown>
-      : {};
-    const modelCompatRaw = (targetModel as Record<string, unknown>).compat;
-    if (modelCompatRaw !== undefined && (typeof modelCompatRaw !== 'object' || modelCompatRaw === null || Array.isArray(modelCompatRaw))) {
-      return `Modified file: model "${modelId}" compat is not an object`;
-    }
-    const mdlCompat = (modelCompatRaw ?? {}) as Record<string, unknown>;
-    const mergedCompat: Record<string, unknown> = { ...provCompat, ...mdlCompat };
-
-    // Step 6: Validate all inserted keys are effective in the merged compat
-    for (const [k, v] of Object.entries(compatKeys)) {
-      if (!(k in mergedCompat)) {
-        return `Modified file: compat.${k} not found at provider or model level (insertion failed)`;
-      }
-      if (mergedCompat[k] !== v) {
-        return `Modified file: effective compat.${k} has wrong value: expected ${JSON.stringify(v)}, got ${JSON.stringify(mergedCompat[k])}`;
-      }
-    }
-    
-    // Step 7: Validate original structure is preserved (no accidental deletions/changes)
-
-    function isSubset(origVal: unknown, modVal: unknown, path = ''): boolean {
-      if (origVal === modVal) return true;
-      if (typeof origVal !== typeof modVal) return false;
-      if (typeof origVal !== 'object' || origVal === null || modVal === null) return false;
-      if (Array.isArray(origVal) !== Array.isArray(modVal)) return false;
-      if (Array.isArray(origVal) && Array.isArray(modVal)) {
-        if (origVal.length !== modVal.length) return false;
-        return origVal.every((_, i) => isSubset(origVal[i], modVal[i], `${path}[${i}]`));
-      }
-      // Both objects: check that every key in orig is in mod with same value
-      const origObj = origVal as Record<string, unknown>;
-      const modObj = modVal as Record<string, unknown>;
-      for (const key of Object.keys(origObj)) {
-        if (!(key in modObj)) return false;
-        if (key === 'compat') {
-          // For compat, allow extra keys in modified (the inserted ones).
-          // Use recursive isSubset so nested objects (e.g. { deep: true })
-          // are compared by content, not reference.
-          if (typeof origObj[key] !== 'object' || typeof modObj[key] !== 'object') {
-            if (origObj[key] !== modObj[key]) return false;
-          } else {
-            const origCompat = origObj[key] as Record<string, unknown>;
-            const modCompat = modObj[key] as Record<string, unknown>;
-            const mayRepairThisCompat = origObj === origProvider || origObj === origTargetModelRecord;
-            for (const ck of Object.keys(origCompat)) {
-              if (!(ck in modCompat)) return false;
-              // The fix may repair an existing wrong compat value (for example
-              // thinkingFormat: "legacy" -> "deepseek"), but only on the
-              // target provider/model compat objects. Sibling compat blocks must
-              // remain structure-equivalent.
-              if (mayRepairThisCompat && Object.prototype.hasOwnProperty.call(compatKeys, ck)) continue;
-              if (!isSubset(origCompat[ck], modCompat[ck], `${path}.${ck}`)) return false;
-            }
-          }
-        } else if (!isSubset(origObj[key], modObj[key], `${path}.${key}`)) {
-          return false;
-        }
-      }
-      return true;
-    }
-
-    if (!isSubset(origParsed, modParsed)) {
-      return "Modified file: original structure was altered (data loss detected)";
-    }
-    
-    // Step 8: Basic format sanity checks
-    if (modified.length < original.length) {
-      return "Modified file: content is shorter than original (possible truncation)";
-    }
-    
-    // Step 9: Validate root bracket integrity with the same string/comment-aware
-    // scanner used for edits. Do not count raw braces: comments or strings may
-    // legitimately contain unmatched `{` / `}` bytes.
-    const modifiedClean = stripJsoncComments(modified);
-    const rootStart = skipJsonWhitespace(modifiedClean, 0);
-    const rootEnd = findMatchingBracket(modifiedClean, rootStart);
-    if (rootEnd === undefined) {
-      return "Modified file: root bracket mismatch";
-    }
-    if (skipJsonWhitespace(modifiedClean, rootEnd + 1) !== modifiedClean.length) {
-      return "Modified file: trailing non-whitespace content after root object";
-    }
-
-    return null;
-  } catch (e) {
-    return `Self-check error: ${e instanceof Error ? e.message : String(e)}`;
-  }
-}
-
-/**
- * Serialize a compat suggestion to the JSON text that will be inserted.
- * Returns the exact key-value pairs as a formatted JSON string without outer braces.
+ * Serialize a compat suggestion to YAML key/value lines for manual insertion.
  */
 function formatCompatKeysForInsertion(compatKeys: Record<string, unknown>): string {
   return Object.entries(compatKeys)
@@ -5155,21 +4327,6 @@ function formatCompatKeysForInsertion(compatKeys: Record<string, unknown>): stri
       return `  ${JSON.stringify(k)}: ${JSON.stringify(v)}`;
     })
     .join(',\n');
-}
-
-/**
- * Generate the timestamp string for backup filename.
- * Format: YYYYMMDDTHHMMSSZ (UTC)
- */
-function backupTimestamp(): string {
-  const now = new Date();
-  const y = now.getUTCFullYear();
-  const m = String(now.getUTCMonth() + 1).padStart(2, '0');
-  const d = String(now.getUTCDate()).padStart(2, '0');
-  const h = String(now.getUTCHours()).padStart(2, '0');
-  const min = String(now.getUTCMinutes()).padStart(2, '0');
-  const s = String(now.getUTCSeconds()).padStart(2, '0');
-  return `${y}${m}${d}T${h}${min}${s}Z`;
 }
 
 // Internal helpers exported only so the task verification script
@@ -5331,7 +4488,7 @@ export const __internals_for_tests = {
   getCompat,
   modelKey,
   // Platform-friendly path helpers
-  getModelsJsonDisplayPath,
+  getModelsYmlDisplayPath,
   buildProviderCompatOverride,
   buildModelCompatOverride,
   captureCacheRetentionEnv,
@@ -5397,20 +4554,9 @@ export const __internals_for_tests = {
   STATE_FILE_PATH,
   LEGACY_STATE_FILE_PATH,
   STATE_DIR,
-  // JSONC surgical edit helpers
-  MODELS_JSON_PATH,
-  stripJsoncComments,
-  stripJsoncTrailingCommas,
-  parseJsonc,
-  locateModelInJsonc,
-  composeFixInsertion,
-  selfCheckFix,
-  decideFixPlacement,
-  chooseFixPlacement,
-  findExistingCompatKeysInJsonc,
-  deepEqualIgnoringKeys,
+  // Manual YAML compat suggestion helpers
+  MODELS_YML_PATH,
   formatCompatKeysForInsertion,
-  backupTimestamp,
   // Fix suggestion builder
   buildFixSuggestion,
   // Adaptive thinking compat helpers
@@ -5959,7 +5105,7 @@ export default function (pi: ExtensionAPI) {
       }
     }
 
-    return mutated ? { payload: resultPayload } : undefined;
+    return mutated ? resultPayload : undefined;
   });
 
   pi.on("after_provider_response", (event, ctx) => {
@@ -6159,12 +5305,12 @@ export default function (pi: ExtensionAPI) {
 
         // OMP divergence: auto-write YAML surgical editor is not yet implemented.
         // /cache-optimizer fix shows copyable YAML compat snippet + manual steps.
-        // The JSONC surgical editor (locateModelInJsonc/composeFixInsertion/selfCheckFix)
-        // is preserved as legacy dead code for a future YAML editor PR.
+        // A future YAML editor must implement its own parser/self-check rather
+        // than reusing the removed JSONC surgical editor from the source project.
         const compatResult = buildCompatDiagnosis(model);
         const yamlSnippet = formatCompatKeysForInsertion(suggestion.compatKeys);
         cmdCtx.ui.notify(
-          `📝 ${getModelsJsonDisplayPath()} 的手动修复建议：\n\n` +
+          `📝 ${getModelsYmlDisplayPath()} 的手动修复建议：\n\n` +
           `提供方：${suggestion.providerLabel}\n` +
           `模型：${suggestion.modelId}\n\n` +
           `在模型级 compat（模型条目下）添加这些键：\n\n` +
@@ -6256,11 +5402,11 @@ export default function (pi: ExtensionAPI) {
               return;
             }
 
-            // OMP divergence: auto-write YAML surgical editor not yet implemented.
+            // OMP divergence: auto-write YAML surgical editor is not yet implemented.
             const compatResult = buildCompatDiagnosis(model);
             const yamlSnippet = formatCompatKeysForInsertion(suggestion.compatKeys);
             cmdCtx.ui.notify(
-              `📝 ${getModelsJsonDisplayPath()} 的手动修复建议：\n\n` +
+              `📝 ${getModelsYmlDisplayPath()} 的手动修复建议：\n\n` +
               `提供方：${suggestion.providerLabel}\n` +
               `模型：${suggestion.modelId}\n\n` +
               `添加这些 compat 键：\n\n` +
