@@ -1997,6 +1997,33 @@ function extractSystemPrompt(payload: unknown): string | undefined {
   return undefined;
 }
 
+function rewriteTextBlockArray(
+  items: unknown[],
+  text: string,
+  makeFallback: (text: string) => Record<string, unknown>,
+): unknown[] {
+  const rewritten: unknown[] = [];
+  let replacedText = false;
+
+  for (const item of items) {
+    const record = asRecord(item);
+    if (typeof record?.text === "string") {
+      if (!replacedText) {
+        rewritten.push({ ...record, text });
+        replacedText = true;
+      }
+      continue;
+    }
+    rewritten.push(item);
+  }
+
+  if (!replacedText) {
+    return [makeFallback(text), ...items];
+  }
+
+  return rewritten;
+}
+
 function setSystemPrompt(payload: unknown, text: string): boolean {
   const record = asRecord(payload);
   if (!record) return false;
@@ -2007,14 +2034,14 @@ function setSystemPrompt(payload: unknown, text: string): boolean {
     return true;
   }
   if (Array.isArray(record.system) && record.system.length > 0) {
-    record.system = [{ type: "text", text }];
+    record.system = rewriteTextBlockArray(record.system, text, (value) => ({ type: "text", text: value }));
     return true;
   }
 
   // google-generative-ai: payload.systemInstruction
   const systemInstruction = asRecord(record.systemInstruction);
   if (systemInstruction && Array.isArray(systemInstruction.parts) && systemInstruction.parts.length > 0) {
-    systemInstruction.parts = [{ text }];
+    systemInstruction.parts = rewriteTextBlockArray(systemInstruction.parts, text, (value) => ({ text: value }));
     return true;
   }
 
@@ -2030,7 +2057,7 @@ function setSystemPrompt(payload: unknown, text: string): boolean {
           return true;
         }
         if (Array.isArray(r.content) && r.content.length > 0) {
-          r.content = text;
+          r.content = rewriteTextBlockArray(r.content, text, (value) => ({ type: "text", text: value }));
           return true;
         }
       }
