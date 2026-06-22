@@ -36,5 +36,9 @@
   },
   "repository": {
     "url": "git+https://github.com/EF-FlowCode/omp-cache-optimizer.git"
+  },
+  "homepage": "https://github.com/EF-FlowCode/omp-cache-optimizer",
+  "bugs": {
+    "url": "https://github.com/EF-FlowCode/omp-cache-optimizer/issues"
   }
 }

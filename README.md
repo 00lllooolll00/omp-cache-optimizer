@@ -186,10 +186,22 @@ OMP 0.79+ 已内置 footer `CH` 标记，用于显示最近一次 prompt cache h
 示例 footer：
 
 ```text
-OpenAI cache 3/10 · 0.002M/0.005M tok (40%) ⚠️ compat
+OpenAI Cache 3/10 · 0.002M/0.005M tok (40%) ⚠️ 配置
 ```
+格式：`<适配器标签> <命中请求数>/<总请求数> · <缓存 tokens>/<总输入 tokens> tok (<token 命中率>)`。部分 adapter 还可能追加 `· 写入 <tokens> tok`，运行时诊断可能追加 `⚠️ 配置` 或 `⚠️ 完整性`。
 
-格式：`<label> <命中请求数>/<总请求数> · <cached input tokens>/<total input tokens> tok (<token 命中率>)`。部分 adapter 还可能追加 `· write <tokens> tok`，运行时诊断可能追加 `⚠️ compat` 或 `⚠️ integrity`。
+各部分说明：
+
+| 部分 | 示例 | 说明 |
+|---|---|---|
+| 适配器标签 | `OpenAI Cache` | 识别到的模型家族，匹配对应的缓存适配器。未命中时显示 `0/0` |
+| 命中/总请求 | `3/10` | 当前 session + 模型下的缓存命中次数与总请求数 |
+| 缓存/总 tokens | `0.002M/0.005M tok` | prompt cache 命中的 input tokens 与总 input tokens（M = million = 百万） |
+| token 命中率 | `(40%)` | 缓存 tokens 占总输入 tokens 的百分比 |
+| 写入 | `· 写入 0.001M tok` | 当前 session 累计新写入 prompt cache 的 tokens。仅 DeepSeek、OpenAI、Gemini 等适配器显示 |
+| `⚠️ 配置` | 显示在末尾 | 当前模型缺少可安全修复的 compat 配置（如 reasoning 相关字段），建议运行 `/cache-optimizer fix` |
+| `⚠️ 完整性` | 显示在末尾 | prompt 重排时检测到结构标记丢失，已回退到原始 prompt。一次性告警，`/reload` 后清除 |
+| `缓存优化已关闭 ·` | 前缀 | `/cache-optimizer disable` 后出现，表示统计以对比模式采集，不再改写 prompt |
 
 支持的 footer label 包括：DS、Claude、OpenAI、Gemini、Kimi、Qwen、GLM、MiniMax、Mimo、Hunyuan、Mistral、Grok、Llama、Nemotron、Cohere、Yi、Doubao、ERNIE、Baichuan、StepFun、Spark、InternLM、Gemma、Phi、Jamba、Solar、Sonar、Nova、Reka、Falcon、DBRX、MPT、StableLM、Aquila、EXAONE、HyperCLOVA、Luminous、Hermes、Granite、Arctic、Pangu、SenseNova、Zhinao、MiniCPM、XVERSE、Orion、OpenChat、Vicuna、Wizard、Zephyr、Dolphin、OpenOrca、Starling、BLOOM、RWKV、Aya。
 
