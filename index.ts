@@ -5097,11 +5097,42 @@ export default function (pi: ExtensionAPI) {
     }
 
     // ── prompt_cache_key injection (OpenAI-compatible) ──
-    if (shouldInjectOpenAIPromptCacheKey() && isOpenAICompatibleApi(requestModel?.api)) {
+    if (shouldInjectOpenAIPromptCacheKey() && isOpenAICompatibleProxyApi(requestModel?.api)) {
       const withKey = addOpenAIPromptCacheKey(resultPayload, getSessionPromptCacheKey(ctx));
       if (withKey !== undefined) {
         resultPayload = withKey;
         mutated = true;
+      }
+    }
+    // ── Safety: strip prompt_cache_retention for 400-history models ──
+    // OMP divergence: Pi defaults supportsLongCacheRetention to true for all
+    // openai-completions models and runs a 4-gate safety check. OMP's pi-ai
+    // only injects prompt_cache_retention when supportsLongPromptCacheRetention
+    // is explicitly true in models.yml (openai-responses path). We therefore
+    // need only two gates:
+    //   Gate 1 – user opt-in (supportsLongPromptCacheRetention: true) → keep
+    //   Gate 2 – 400 history (this process) → strip (overrides Gate 1)
+    // Gate 2 is critical: if the user opted in but the endpoint returned 400,
+    // we must strip — otherwise the 400 repeats every request.
+    if (runtimeOptimizerEnabled) {
+      const payloadRecord = asRecord(resultPayload);
+      if (payloadRecord && typeof payloadRecord.prompt_cache_retention === "string") {
+        const stripModel = resolveRouteModel(ctx.model, ctx) ?? ctx.model;
+        if (stripModel) {
+          if (promptCacheRetention400Models.has(modelKey(stripModel))) {
+            // Gate 2: 400 history → strip (empirical evidence overrides user opt-in)
+            delete payloadRecord.prompt_cache_retention;
+            mutated = true;
+          } else if (getCompat(stripModel).supportsLongPromptCacheRetention !== true) {
+            // Safety net: no explicit user opt-in → strip.
+            // pi-ai requires supportsLongPromptCacheRetention: true before it injects
+            // prompt_cache_retention; if the field is present without that compat flag,
+            // another source injected it — strip to prevent 400s on third-party proxies.
+            delete payloadRecord.prompt_cache_retention;
+            mutated = true;
+          }
+          // Implicit Gate 1: user opted in AND no 400 history → keep
+        }
       }
     }
 
