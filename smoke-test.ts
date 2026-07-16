@@ -12,7 +12,9 @@
  * 6. OMP 17 session-overview churn strip + hook 级回归
  */
 
-// 保证本进程不受宿主 prompt 重写开关影响（OMP_ 主名 + 旧 PI_ 兼容名）。
+// 默认不改写；仅 OMP_CACHE_OPTIMIZER_PROMPT_REWRITE=1 可显式启用。
+// 历史 NO_PROMPT_REWRITE 变量不再影响行为。
+delete process.env.OMP_CACHE_OPTIMIZER_PROMPT_REWRITE;
 delete process.env.OMP_CACHE_OPTIMIZER_NO_PROMPT_REWRITE;
 delete process.env.PI_CACHE_OPTIMIZER_NO_PROMPT_REWRITE;
 
@@ -34,6 +36,9 @@ const {
   asRecord,
   stripSessionOverviewChurn,
   mapSystemPromptBlocks,
+  fingerprintPrompt,
+  comparePromptFingerprints,
+  getPromptCacheKeySource,
 } = __internals_for_tests;
 
 let passed = 0;
@@ -505,7 +510,17 @@ const skillsBlock = [
 ].join("\n");
 const unknownBlock = "<unknown-extension>\nsecret payload must survive\n</unknown-extension>";
 
-// 1. before_agent_start：保留块数量、顺序、skill 描述、未知块；仅清理 session-overview churn
+// 1. before_agent_start：默认保持原始 system prompt。
+const defaultRewriteResult = await harness.runBeforeAgentStart({ type: "before_agent_start", prompt: "hi", systemPrompt: [primaryBlock, overviewBlock, skillsBlock, unknownBlock] });
+const defaultRewriteBlocks = (asRecord(defaultRewriteResult)?.systemPrompt as string[] | undefined) ?? [primaryBlock, overviewBlock, skillsBlock, unknownBlock];
+expect(
+  "before_agent_start.default-does-not-rewrite",
+  defaultRewriteBlocks[1] === overviewBlock,
+  `未设置 OMP_CACHE_OPTIMIZER_PROMPT_REWRITE 时应保留原始 session-overview，实际: ${JSON.stringify(defaultRewriteBlocks[1])}`,
+);
+
+// 2. 显式 opt-in 时：保留块数量、顺序、skill 描述、未知块；仅清理 session-overview churn。
+process.env.OMP_CACHE_OPTIMIZER_PROMPT_REWRITE = "1";
 const result1 = await harness.runBeforeAgentStart({ type: "before_agent_start", prompt: "hi", systemPrompt: [primaryBlock, overviewBlock, skillsBlock, unknownBlock] });
 const out1 = (asRecord(result1)?.systemPrompt as string[] | undefined) ?? [primaryBlock, overviewBlock, skillsBlock, unknownBlock];
 expect(
@@ -536,6 +551,19 @@ expect(
   `session-overview churn 应被清理但保留 CURRENT TASK，实际: ${JSON.stringify(out1[1])}`,
 );
 
+// 3. 历史 NO_PROMPT_REWRITE 变量已不再受支持，不能覆盖新变量的显式 opt-in。
+process.env.OMP_CACHE_OPTIMIZER_NO_PROMPT_REWRITE = "1";
+process.env.PI_CACHE_OPTIMIZER_NO_PROMPT_REWRITE = "1";
+const legacyEnvResult = await harness.runBeforeAgentStart({ type: "before_agent_start", prompt: "hi", systemPrompt: [primaryBlock, overviewBlock] });
+const legacyEnvBlocks = (asRecord(legacyEnvResult)?.systemPrompt as string[] | undefined) ?? [primaryBlock, overviewBlock];
+expect(
+  "before_agent_start.ignores-legacy-no-rewrite-env",
+  !legacyEnvBlocks[1].includes("RECENT COMMITS"),
+  `历史 NO_PROMPT_REWRITE 变量不应影响显式 prompt 改写，实际: ${JSON.stringify(legacyEnvBlocks[1])}`,
+);
+delete process.env.OMP_CACHE_OPTIMIZER_NO_PROMPT_REWRITE;
+delete process.env.PI_CACHE_OPTIMIZER_NO_PROMPT_REWRITE;
+
 // 2. before_agent_start：无变化时返回 {}（非 { systemPrompt: [...] }）
 const result2 = await harness.runBeforeAgentStart({ type: "before_agent_start", prompt: "hi", systemPrompt: ["stable block one with enough text", "stable block two with enough text"] });
 expect(
@@ -544,14 +572,40 @@ expect(
   `无变化时应返回 {}，实际: ${JSON.stringify(result2)}`,
 );
 
-// 3. before_provider_request：不向 provider body 注入 prompt_cache_key
+// 3. before_provider_request：对 openai-completions 代理注入 prompt_cache_key
 const providerCtx = makeContext({ model: { provider: "proxy", id: "gpt-test", api: "openai-completions", baseUrl: "https://proxy.example/v1" } });
 const providerPayload: Record<string, unknown> = { model: "gpt-test", messages: [] };
 const result3 = harness.runBeforeProviderRequest({ payload: providerPayload }, providerCtx);
 expect(
-  "before_provider_request.does-not-inject-prompt-cache-key",
-  result3 === undefined && providerPayload.prompt_cache_key === undefined && providerPayload.promptCacheKey === undefined,
-  `不应注入 prompt_cache_key，实际 result=${JSON.stringify(result3)} payload=${JSON.stringify(providerPayload)}`,
+  "before_provider_request.injects-prompt-cache-key-for-proxy",
+  providerPayload.prompt_cache_key === "host-cache-key",
+  `openai-completions 代理应注入 host-cache-key，实际: ${JSON.stringify(providerPayload)}`,
+);
+// no-op API 不注入
+const noApiCtx = makeContext({ model: { provider: "test", id: "no-api", api: undefined } });
+const noApiPayload: Record<string, unknown> = { messages: [] };
+harness.runBeforeProviderRequest({ payload: noApiPayload }, noApiCtx);
+expect(
+  "before_provider_request.does-not-inject-for-unknown-api",
+  noApiPayload.prompt_cache_key === undefined && noApiPayload.promptCacheKey === undefined,
+  `未知 API 不应注入，实际: ${JSON.stringify(noApiPayload)}`,
+);
+// 3b. openai-responses 也注入（宿主未注入时兜底）
+const responsesCtx = makeContext({ model: { provider: "proxy", id: "gpt-test", api: "openai-responses", baseUrl: "https://proxy.example/v1" } });
+const responsesPayload: Record<string, unknown> = { model: "gpt-test", input: [] };
+harness.runBeforeProviderRequest({ payload: responsesPayload }, responsesCtx);
+expect(
+  "before_provider_request.injects-for-openai-responses-when-missing",
+  responsesPayload.prompt_cache_key === "host-cache-key",
+  `openai-responses 无已有 key 时应注入，实际: ${JSON.stringify(responsesPayload)}`,
+);
+// 3c. openai-responses 宿主已注入时不覆盖
+const responsesHostPayload: Record<string, unknown> = { model: "gpt-test", input: [], prompt_cache_key: "host-responses-key" };
+harness.runBeforeProviderRequest({ payload: responsesHostPayload }, responsesCtx);
+expect(
+  "before_provider_request.preserves-host-injected-responses-key",
+  responsesHostPayload.prompt_cache_key === "host-responses-key",
+  `宿主已注入的 responses key 不应覆盖，实际: ${JSON.stringify(responsesHostPayload)}`,
 );
 
 // 4. before_provider_request：已有 cache key 字段不被覆盖
@@ -567,6 +621,29 @@ expect(
   harness.runBeforeProviderRequest({ payload: camelPayload }, providerCtx) === undefined && camelPayload.promptCacheKey === "camel-key",
   `已有 camelCase key 不应被覆盖，实际: ${JSON.stringify(camelPayload)}`,
 );
+// 3d. 无 host header 时 fallback 到 sessionId 并截断到 64 字符（防 OpenAI 400）
+const longSessionId = "x".repeat(80);
+const fallbackCtx = makeContext({ sessionManager: { getSessionId: () => longSessionId, getHeader: () => ({}) } });
+const fallbackPayload: Record<string, unknown> = { model: "gpt-test", messages: [] };
+harness.runBeforeProviderRequest({ payload: fallbackPayload }, fallbackCtx);
+expect(
+  "before_provider_request.fallback-session-id-clamped-to-64",
+  typeof fallbackPayload.prompt_cache_key === "string" &&
+    (fallbackPayload.prompt_cache_key as string).length === 64 &&
+    (fallbackPayload.prompt_cache_key as string) === "x".repeat(64),
+  `无 header 时应 fallback 到 sessionId 并截断到 64 字符，实际: ${JSON.stringify(fallbackPayload.prompt_cache_key)}`,
+);
+// 3e. 运行时禁用（/cache-optimizer disable）时不注入
+const prevEnabled = __internals_for_tests.isRuntimeOptimizerEnabled();
+__internals_for_tests.setRuntimeOptimizerEnabled(false);
+const disabledPayload: Record<string, unknown> = { model: "gpt-test", messages: [] };
+harness.runBeforeProviderRequest({ payload: disabledPayload }, providerCtx);
+expect(
+  "before_provider_request.no-inject-when-runtime-disabled",
+  disabledPayload.prompt_cache_key === undefined && disabledPayload.promptCacheKey === undefined,
+  `运行时禁用不应注入 prompt_cache_key，实际: ${JSON.stringify(disabledPayload)}`,
+);
+__internals_for_tests.setRuntimeOptimizerEnabled(prevEnabled);
 
 // 5. cache hints：优先使用 OMP 17 header 的 providerPromptCacheKey，缺失时 fallback session id
 const hintService = __internals_for_tests.getCacheHintsService();
@@ -625,6 +702,30 @@ expect(
     !strippedBlocks[0].includes("Line count:") &&
     strippedBlocks[0].includes("CURRENT TASK"),
   `块映射 strip 应去掉 churn 字段，实际: ${JSON.stringify(strippedBlocks[0])}`,
+);
+
+// ── 7. Prompt cache 诊断（仅哈希，不保留 prompt 或 cache key 原文） ─────
+
+const diagnosticPrompt = "system prompt with stable content";
+const fingerprint = fingerprintPrompt(diagnosticPrompt);
+expect(
+  "prompt-diagnostics.fingerprint-is-stable-and-redacted",
+  typeof fingerprint === "string" && /^[a-f0-9]{16}$/.test(fingerprint) && !fingerprint.includes("stable content"),
+  `指纹应为不包含 prompt 原文的 16 位 SHA-256 前缀，实际: ${JSON.stringify(fingerprint)}`,
+);
+expect(
+  "prompt-diagnostics.compares-identical-and-different-prompts",
+  comparePromptFingerprints(fingerprintPrompt(diagnosticPrompt), fingerprintPrompt(diagnosticPrompt)) === "match" &&
+    comparePromptFingerprints(fingerprintPrompt(diagnosticPrompt), fingerprintPrompt("changed prompt")) === "mismatch" &&
+    comparePromptFingerprints(fingerprintPrompt(diagnosticPrompt), undefined) === "unavailable",
+  "相同指纹应匹配，不同指纹应标记不一致，缺失指纹应标记不可比较",
+);
+expect(
+  "prompt-diagnostics.cache-key-source-does-not-retain-key",
+  getPromptCacheKeySource({ providerPromptCacheKey: "secret-provider-key" }, "fallback-session-id") === "header" &&
+    getPromptCacheKeySource({}, "fallback-session-id") === "session" &&
+    getPromptCacheKeySource({}, undefined) === "unavailable",
+  "仅应记录 cache key 来源，不能存储 key 原文",
 );
 
 // ── 结果汇总 ─────────────────────────────────────────────────────
