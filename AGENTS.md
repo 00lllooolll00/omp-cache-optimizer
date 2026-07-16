@@ -13,14 +13,14 @@ OMP Runtime (host, Bun-based)
   ├─ turn_start           → model-change detection, publish footer status
   ├─ before_agent_start   → 主 prompt 重写（string[] 块：仅 <session-overview> churn strip，保持块顺序与内容）
   │                         + route snapshot + cache hint
-  ├─ before_provider_request → 安全网：session-overview 兜底 strip + prompt_cache_retention 安全网
+  ├─ before_provider_request → 安全网：session-overview 兜底 strip + prompt_cache_retention 安全网 + prompt_cache_key 兜底注入（OpenAI-compatible）
   ├─ after_provider_response → detect 400 compat signals
   └─ message_end          → scrape OMP-normalized usage, persist stats, publish footer
 ```
 
 - **Single-file monolith**: All logic lives in `index.ts` (~5,100 lines). No `src/` tree.
 - **Extension entry**: `export default function (pi: ExtensionAPI) { … }` — registers hooks + `/cache-optimizer` command.
-- **Prompt rewriting in `before_agent_start`**：OMP 17 适配。仅对 `event.systemPrompt: string[]` 块数组逐块调用 `stripSessionOverviewChurn()`，保持块顺序与 skill 描述逐字不变，不压缩、不重排。`before_provider_request` 仅做 payload 级 session-overview 兜底 strip 与 `prompt_cache_retention` 安全网；provider-facing `prompt_cache_key` 由 OMP 17 宿主解析，扩展只读 header key 供 cache hint。`extractSystemPrompt()` / `setSystemPrompt()` 处理 `payload.system`（Anthropic）、`payload.systemInstruction`（Google）、`payload.messages[0].content`（OpenAI）形态。
+- **Prompt rewriting in `before_agent_start`**：OMP 17 适配。仅对 `event.systemPrompt: string[]` 块数组逐块调用 `stripSessionOverviewChurn()`，保持块顺序与 skill 描述逐字不变，不压缩、不重排。`before_provider_request` 做 payload 级 session-overview 兜底 strip、`prompt_cache_retention` 安全网，并为 OpenAI-compatible API（host 不注入的 openai-completions chat wire）兜底注入 body `prompt_cache_key`（读 header `providerPromptCacheKey` ?? sessionId，截断 64 字符，payload 已有则不覆盖）。`extractSystemPrompt()` / `setSystemPrompt()` 处理 `payload.system`（Anthropic）、`payload.systemInstruction`（Google）、`payload.messages[0].content`（OpenAI）形态。
 - **Adapter pattern**: `CACHE_PROVIDER_ADAPTERS` array of ~50 adapter objects. Selected by token-matching on model id/name.
 - **Stats persistence**: Session-scoped, versioned JSON at `~/.omp/agent/omp-cache-optimizer-stats.json` (v5 format). Atomic writes via temp + rename. Never persists prompts, payloads, or API keys.
 - **Inter-extension protocol**: Two `Symbol.for` global registries — `omp.routing.registry.v1` (live routing) and `omp.cache.hints.v1` (pre-request hints).
@@ -78,7 +78,7 @@ Each `CacheProviderAdapter` defines: `id`, `label`, `matchesModel(model)`, `matc
 
 1. `stripSessionOverviewChurn()` — 逐块移除 `<session-overview>` 中的易变字段（RECENT COMMITS、Working directory、Line count），保持块顺序与 skill 描述逐字不变。不压缩 skills、不重排块。
 
-`before_provider_request` 安全网：若 `before_agent_start` 未跑或被覆盖，对 payload 中的 system prompt 兜底 strip session-overview churn；并按 400-history 与 compat 对 `prompt_cache_retention` 做安全 strip。不注入 `prompt_cache_key`。
+`before_provider_request` 安全网：若 `before_agent_start` 未跑或被覆盖，对 payload 中的 system prompt 兜底 strip session-overview churn；并按 400-history 与 compat 对 `prompt_cache_retention` 做安全 strip。另为 OpenAI-compatible API（openai-completions / openai-responses）在 payload 缺失时兜底注入 `prompt_cache_key`（读 header `providerPromptCacheKey` ?? sessionId，截断 64 字符防 400，payload 已有则不覆盖）。
 
 ### `/cache-optimizer fix` — Current Status
 
