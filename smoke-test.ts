@@ -9,9 +9,14 @@
  * 3. 统计计算（addUsageToCacheStats + formatCacheStats）
  * 4. extractSystemPrompt / setSystemPrompt（三种 payload 格式）
  * 5. buildFixSuggestion（DeepSeek 模型返回 requiresReasoningContentForToolCalls）
+ * 6. OMP 17 session-overview churn strip + hook 级回归
  */
 
-import { __internals_for_tests } from "./index.ts";
+// 保证本进程不受宿主 prompt 重写开关影响（OMP_ 主名 + 旧 PI_ 兼容名）。
+delete process.env.OMP_CACHE_OPTIMIZER_NO_PROMPT_REWRITE;
+delete process.env.PI_CACHE_OPTIMIZER_NO_PROMPT_REWRITE;
+
+import cacheOptimizer, { __internals_for_tests } from "./index.ts";
 
 const {
   isDeepSeekLikeModel,
@@ -27,7 +32,8 @@ const {
   extractSystemPrompt,
   setSystemPrompt,
   asRecord,
-  addOpenAIPromptCacheKey,
+  stripSessionOverviewChurn,
+  mapSystemPromptBlocks,
 } = __internals_for_tests;
 
 let passed = 0;
@@ -195,20 +201,26 @@ const formatted = formatCacheStats(
   stats,
 );
 expect(
-  "formatCacheStats.includes-hit-ratio",
-  formatted.includes("1/2") === true,
-  `应包含 1/2 命中率，实际: "${formatted}"`,
+  "formatCacheStats.token-hit-label",
+  formatted.includes("缓存命中率：40%") === true,
+  `应包含「缓存命中率：40%」，实际: "${formatted}"`,
 );
 expect(
-  "formatCacheStats.includes-40-percent",
-  formatted.includes("40%") === true,
-  `应包含 40% 百分比，实际: "${formatted}"`,
+  "formatCacheStats.request-hit-label",
+  formatted.includes("缓存请求命中次数：1/2 次") === true,
+  `应包含请求命中次数标签，实际: "${formatted}"`,
+);
+expect(
+  "formatCacheStats.token-volume-label",
+  formatted.includes("缓存token/总输入：800/2.00k") === true ||
+    formatted.includes("缓存token/总输入：800/2000") === true,
+  `应包含 token 量标签，实际: "${formatted}"`,
 );
 expect(
   "formatCacheStats.uses-cache-word",
-  formatted.includes("Cache 1/2") === true,
-  `应包含 Cache 1/2，实际: "${formatted}"`,
-)
+  formatted.includes("OpenAI Cache") === true && formatted.includes(" | ") === true,
+  `应包含 OpenAI Cache 与分隔符，实际: "${formatted}"`,
+);
 
 // ── 4. extractSystemPrompt / setSystemPrompt ─────────────────────
 
@@ -416,20 +428,161 @@ expect(
   "无 system prompt 应返回 undefined",
 );
 
-// ── 5. OpenAI prompt_cache_key 注入 ─────────────────────────────
+// ── 4b. OMP 17 hook 级回归 harness ──────────────────────────────
 
-const cacheKeyPayload: Record<string, unknown> = { messages: [{ role: "user", content: "hello" }] };
-const cacheKeyResult = addOpenAIPromptCacheKey(cacheKeyPayload, "session-cache-key");
+type HarnessCtx = {
+  model?: { provider: string; id: string; name?: string; api?: string; baseUrl?: string; compat?: Record<string, unknown> };
+  modelRegistry: { find(p: string, id: string): unknown; getAvailable(): unknown[]; getAll(): unknown[] };
+  sessionManager: { getSessionId(): string; getHeader?(): Record<string, unknown> };
+  ui: { notify(m: string, l?: string): void; setStatus(k: string, v?: string): void; confirm(t: string, m: string): Promise<boolean>; select(t: string, o: string[]): Promise<string | undefined> };
+  cwd?: string;
+  hasUI?: boolean;
+};
+
+function makeContext(overrides: { model?: HarnessCtx["model"]; sessionManager?: Partial<HarnessCtx["sessionManager"]>; } = {}): HarnessCtx {
+  const sessionId = overrides.sessionManager?.getSessionId ? overrides.sessionManager.getSessionId() : "test-session-id";
+  const defaultHeader = { providerPromptCacheKey: "host-cache-key", providerSessionId: "provider-session-id" };
+  const header = overrides.sessionManager?.getHeader ? overrides.sessionManager.getHeader() : defaultHeader;
+  return {
+    model: overrides.model ?? { provider: "test", id: "test-model", api: "openai-completions", baseUrl: "https://proxy.example/v1" },
+    modelRegistry: { find: () => undefined, getAvailable: () => [], getAll: () => [] },
+    sessionManager: { getSessionId: () => sessionId, getHeader: () => header },
+    ui: { notify: () => {}, setStatus: () => {}, confirm: async () => true, select: async () => undefined },
+    cwd: "/tmp",
+    hasUI: false,
+  };
+}
+
+function createExtensionHarness(): {
+  handlers: Record<string, Function[]>;
+  runBeforeAgentStart(event: Record<string, unknown>, ctx?: HarnessCtx): Promise<unknown>;
+  runBeforeProviderRequest(event: { payload: unknown }, ctx?: HarnessCtx): unknown;
+} {
+  const handlers: Record<string, Function[]> = {};
+  const pi = {
+    on(event: string, handler: Function) { (handlers[event] ??= []).push(handler); },
+    registerCommand() {},
+  };
+  cacheOptimizer(pi as unknown as Parameters<typeof cacheOptimizer>[0]);
+  return {
+    handlers,
+    async runBeforeAgentStart(event, ctx = makeContext()) {
+      const fn = handlers["before_agent_start"]?.[0];
+      if (!fn) throw new Error("before_agent_start handler not registered");
+      return fn(event, ctx);
+    },
+    runBeforeProviderRequest(event, ctx = makeContext()) {
+      const fn = handlers["before_provider_request"]?.[0];
+      if (!fn) throw new Error("before_provider_request handler not registered");
+      return fn(event, ctx);
+    },
+  };
+}
+
+const harness = createExtensionHarness();
+
+const primaryBlock = "# Primary system prompt with enough content to be stable";
+const overviewBlock = [
+  "<session-overview>",
+  "## DEVELOPER",
+  "dev notes",
+  "## RECENT COMMITS",
+  "abc123 fix stuff",
+  "def456 more stuff",
+  "## CURRENT TASK",
+  "do the thing",
+  "Working directory: 3 uncommitted",
+  "Line count: 12 / 2000",
+  "</session-overview>",
+].join("\n");
+const skillsBlock = [
+  "<skills>",
+  "- alpha: Alpha 技能说明很长",
+  "- beta: Beta 描述内容",
+  "- gamma: Gamma 描述内容",
+  "- delta: Delta 描述内容",
+  "</skills>",
+].join("\n");
+const unknownBlock = "<unknown-extension>\nsecret payload must survive\n</unknown-extension>";
+
+// 1. before_agent_start：保留块数量、顺序、skill 描述、未知块；仅清理 session-overview churn
+const result1 = await harness.runBeforeAgentStart({ type: "before_agent_start", prompt: "hi", systemPrompt: [primaryBlock, overviewBlock, skillsBlock, unknownBlock] });
+const out1 = (asRecord(result1)?.systemPrompt as string[] | undefined) ?? [primaryBlock, overviewBlock, skillsBlock, unknownBlock];
 expect(
-  "addOpenAIPromptCacheKey.mutates-in-place",
-  cacheKeyResult === cacheKeyPayload && cacheKeyPayload.prompt_cache_key === "session-cache-key",
-  `应原地写入 prompt_cache_key，实际: ${JSON.stringify(cacheKeyPayload)}`,
+  "before_agent_start.preserve-block-count-and-order",
+  Array.isArray(out1) && out1.length === 4 &&
+    out1[0].startsWith("# Primary") &&
+    out1[1].includes("<session-overview>") &&
+    out1[2].includes("<skills>") &&
+    out1[3].includes("<unknown-extension>"),
+  `块数量和顺序应保持 4 块且原序，实际: ${JSON.stringify(out1)}`,
 );
-const existingCacheKeyPayload: Record<string, unknown> = { prompt_cache_key: "existing" };
 expect(
-  "addOpenAIPromptCacheKey.keeps-existing-key",
-  addOpenAIPromptCacheKey(existingCacheKeyPayload, "next") === undefined && existingCacheKeyPayload.prompt_cache_key === "existing",
-  `已有 prompt_cache_key 不应被覆盖，实际: ${JSON.stringify(existingCacheKeyPayload)}`,
+  "before_agent_start.preserve-skill-descriptions",
+  out1[2].includes("Alpha 技能说明很长") && out1[2].includes("Beta 描述内容"),
+  `skill 描述应逐字保留，实际: ${JSON.stringify(out1[2])}`,
+);
+expect(
+  "before_agent_start.preserve-unknown-block",
+  out1[3] === unknownBlock,
+  `未知块应逐字保留，实际: ${JSON.stringify(out1[3])}`,
+);
+expect(
+  "before_agent_start.strip-session-overview-churn",
+  !out1[1].includes("RECENT COMMITS") &&
+    !out1[1].includes("Working directory:") &&
+    !out1[1].includes("Line count:") &&
+    out1[1].includes("CURRENT TASK"),
+  `session-overview churn 应被清理但保留 CURRENT TASK，实际: ${JSON.stringify(out1[1])}`,
+);
+
+// 2. before_agent_start：无变化时返回 {}（非 { systemPrompt: [...] }）
+const result2 = await harness.runBeforeAgentStart({ type: "before_agent_start", prompt: "hi", systemPrompt: ["stable block one with enough text", "stable block two with enough text"] });
+expect(
+  "before_agent_start.no-change-returns-empty-object",
+  result2 !== undefined && typeof result2 === "object" && !("systemPrompt" in (asRecord(result2) ?? {})),
+  `无变化时应返回 {}，实际: ${JSON.stringify(result2)}`,
+);
+
+// 3. before_provider_request：不向 provider body 注入 prompt_cache_key
+const providerCtx = makeContext({ model: { provider: "proxy", id: "gpt-test", api: "openai-completions", baseUrl: "https://proxy.example/v1" } });
+const providerPayload: Record<string, unknown> = { model: "gpt-test", messages: [] };
+const result3 = harness.runBeforeProviderRequest({ payload: providerPayload }, providerCtx);
+expect(
+  "before_provider_request.does-not-inject-prompt-cache-key",
+  result3 === undefined && providerPayload.prompt_cache_key === undefined && providerPayload.promptCacheKey === undefined,
+  `不应注入 prompt_cache_key，实际 result=${JSON.stringify(result3)} payload=${JSON.stringify(providerPayload)}`,
+);
+
+// 4. before_provider_request：已有 cache key 字段不被覆盖
+const snakePayload: Record<string, unknown> = { prompt_cache_key: "raw-session-id", messages: [] };
+expect(
+  "before_provider_request.keeps-existing-snake-key",
+  harness.runBeforeProviderRequest({ payload: snakePayload }, providerCtx) === undefined && snakePayload.prompt_cache_key === "raw-session-id",
+  `已有 snake_case key 不应被覆盖，实际: ${JSON.stringify(snakePayload)}`,
+);
+const camelPayload: Record<string, unknown> = { promptCacheKey: "camel-key", messages: [] };
+expect(
+  "before_provider_request.keeps-existing-camel-key",
+  harness.runBeforeProviderRequest({ payload: camelPayload }, providerCtx) === undefined && camelPayload.promptCacheKey === "camel-key",
+  `已有 camelCase key 不应被覆盖，实际: ${JSON.stringify(camelPayload)}`,
+);
+
+// 5. cache hints：优先使用 OMP 17 header 的 providerPromptCacheKey，缺失时 fallback session id
+const hintService = __internals_for_tests.getCacheHintsService();
+const hint1 = hintService?.getHints({});
+expect(
+  "cache-hints.uses-providerPromptCacheKey-before-session-id",
+  hint1?.promptCacheKey === "host-cache-key",
+  `hint 应使用 header 的 providerPromptCacheKey，实际: ${JSON.stringify(hint1?.promptCacheKey)}`,
+);
+const noHeaderCtx = makeContext({ sessionManager: { getSessionId: () => "fallback-session-id", getHeader: () => ({}) } });
+await harness.runBeforeAgentStart({ type: "before_agent_start", prompt: "hi", systemPrompt: [primaryBlock] }, noHeaderCtx);
+const hint2 = hintService?.getHints({});
+expect(
+  "cache-hints.fallback-to-session-id-when-no-header-key",
+  hint2?.promptCacheKey === "fallback-session-id",
+  `无 header key 时应 fallback 到 session id，实际: ${JSON.stringify(hint2?.promptCacheKey)}`,
 );
 
 // ── 5. asRecord 类型守卫 ─────────────────────────────────────────
@@ -448,6 +601,30 @@ expect(
   "asRecord.string",
   asRecord("hello") === undefined,
   "字符串应返回 undefined",
+);
+
+// ── 6. OMP 17 session-overview churn ──────────────────────────
+
+const overviewWithChurn = [
+  "<session-overview>",
+  "## DEVELOPER",
+  "dev",
+  "## RECENT COMMITS",
+  "abc123 fix stuff",
+  "## CURRENT TASK",
+  "task",
+  "Working directory: 3 uncommitted",
+  "Line count: 12 / 2000",
+  "</session-overview>",
+].join("\n");
+const strippedBlocks = mapSystemPromptBlocks([overviewWithChurn], stripSessionOverviewChurn);
+expect(
+  "stripSessionOverviewChurn.block-map",
+  !strippedBlocks[0].includes("RECENT COMMITS") &&
+    !strippedBlocks[0].includes("Working directory:") &&
+    !strippedBlocks[0].includes("Line count:") &&
+    strippedBlocks[0].includes("CURRENT TASK"),
+  `块映射 strip 应去掉 churn 字段，实际: ${JSON.stringify(strippedBlocks[0])}`,
 );
 
 // ── 结果汇总 ─────────────────────────────────────────────────────

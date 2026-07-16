@@ -1,7 +1,7 @@
 {
   "name": "omp-cache-optimizer",
-  "version": "1.0.8",
-  "description": "Improve OMP prompt/KV cache hit rates with stable prompts, OpenAI-compatible cache keys, proxy compat warnings, and footer cache stats.",
+  "version": "1.1.0",
+  "description": "Improve OMP prompt/KV cache hit rates with safer prompt churn cleanup, proxy compat warnings, and footer cache stats.",
   "keywords": [
     "omp-package",
     "omp",
@@ -32,7 +32,7 @@
     ]
   },
   "peerDependencies": {
-    "@oh-my-pi/pi-coding-agent": "*"
+    "@oh-my-pi/pi-coding-agent": ">=17.0.0 <18.0.0"
   },
   "repository": {
     "url": "git+https://github.com/EF-FlowCode/omp-cache-optimizer.git"

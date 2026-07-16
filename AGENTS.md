@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-OMP Cache Optimizer (npm: `omp-cache-optimizer`) is a single-file TypeScript OMP (Oh My Pi) extension that improves provider-side prompt/KV cache hit rates. It is a fork of `pi-cache-optimizer` adapted for OMP's runtime: YAML model config (`models.yml`), `@oh-my-pi/pi-coding-agent` package scope, `before_provider_request`-based prompt rewriting, and remapped compat fields.
+OMP Cache Optimizer (npm: `omp-cache-optimizer`) is a single-file TypeScript OMP (Oh My Pi) extension that improves provider-side prompt/KV cache hit rates. It is a fork of `pi-cache-optimizer` adapted for OMP's runtime: YAML model config (`models.yml`), `@oh-my-pi/pi-coding-agent` package scope, `before_agent_start`-based prompt rewriting (OMP 17 string[] blocks), and remapped compat fields.
 
 ## Architecture & Data Flow
 
@@ -11,18 +11,16 @@ OMP Runtime (host, Bun-based)
   │
   ├─ session_start        → restore persisted stats, sync session hash
   ├─ turn_start           → model-change detection, publish footer status
-  │                         (replaces the original project’s `model_select` event)
-  ├─ before_agent_start   → cache systemPromptOptions + route snapshot
-  │                         (cannot mutate systemPrompt in OMP — returns {})
-  ├─ before_provider_request → 3-step prompt rewrite on payload + inject
-  │                              prompt_cache_key (OpenAI compat)
+  ├─ before_agent_start   → 主 prompt 重写（string[] 块：仅 <session-overview> churn strip，保持块顺序与内容）
+  │                         + route snapshot + cache hint
+  ├─ before_provider_request → 安全网：session-overview 兜底 strip + prompt_cache_retention 安全网
   ├─ after_provider_response → detect 400 compat signals
   └─ message_end          → scrape OMP-normalized usage, persist stats, publish footer
 ```
 
-- **Single-file monolith**: All logic lives in `index.ts` (~6,500 lines). No `src/` tree.
+- **Single-file monolith**: All logic lives in `index.ts` (~5,100 lines). No `src/` tree.
 - **Extension entry**: `export default function (pi: ExtensionAPI) { … }` — registers hooks + `/cache-optimizer` command.
-- **Prompt rewriting in `before_provider_request`**: OMP-specific adaptation. The 3-step pipeline (churn strip → skill compression → stable-prefix reorder) runs on the provider payload's system prompt field, extracted via `extractSystemPrompt()` / `setSystemPrompt()` which handle `payload.system` (Anthropic), `payload.systemInstruction` (Google), and `payload.messages[0].content` (OpenAI) shapes.
+- **Prompt rewriting in `before_agent_start`**：OMP 17 适配。仅对 `event.systemPrompt: string[]` 块数组逐块调用 `stripSessionOverviewChurn()`，保持块顺序与 skill 描述逐字不变，不压缩、不重排。`before_provider_request` 仅做 payload 级 session-overview 兜底 strip 与 `prompt_cache_retention` 安全网；provider-facing `prompt_cache_key` 由 OMP 17 宿主解析，扩展只读 header key 供 cache hint。`extractSystemPrompt()` / `setSystemPrompt()` 处理 `payload.system`（Anthropic）、`payload.systemInstruction`（Google）、`payload.messages[0].content`（OpenAI）形态。
 - **Adapter pattern**: `CACHE_PROVIDER_ADAPTERS` array of ~50 adapter objects. Selected by token-matching on model id/name.
 - **Stats persistence**: Session-scoped, versioned JSON at `~/.omp/agent/omp-cache-optimizer-stats.json` (v5 format). Atomic writes via temp + rename. Never persists prompts, payloads, or API keys.
 - **Inter-extension protocol**: Two `Symbol.for` global registries — `omp.routing.registry.v1` (live routing) and `omp.cache.hints.v1` (pre-request hints).
@@ -43,9 +41,9 @@ OMP Runtime (host, Bun-based)
 |---|---|
 | `bunx tsc --noEmit` | Type-check only (project uses `noEmit: true`) |
 | `npm pack --dry-run` | Verify package contents before publish |
-| `bun .trellis/tasks/archive/<date>/<task>/verify.ts` | Run task verification scripts (Bun, not node/tsx) |
+| `bun smoke-test.ts` | Run the smoke test (Bun) — exercises `__internals_for_tests` helpers + OMP 17 hook harness |
 
-**No build step** — the extension is consumed as raw TypeScript by the OMP runtime. **No test framework** — verification is done via hand-written `verify.ts` scripts that import `__internals_for_tests` from `index.ts`, run assertions with `expect(label, condition, message)`, and exit 0/1.
+**No build step** — the extension is consumed as raw TypeScript by the OMP runtime. **No test framework** — verification is done via `smoke-test.ts`, which imports `__internals_for_tests` from `index.ts` and the default export, runs assertions with `expect(label, condition, message)`, and exits 0/1.
 
 ## Code Conventions & Common Patterns
 
@@ -59,7 +57,7 @@ OMP Runtime (host, Bun-based)
 
 - `target: ES2022`, `module: NodeNext`, `strict: false`, `noEmit: true`
 - Runtime validation via type guards (`isPiRouterAdapterV1()`, `asRecord()`)
-- Env var names keep `PI_CACHE_OPTIMIZER_*` prefix — OMP mirrors `OMP_*` → `PI_*` automatically
+- 环境变量主前缀为 `OMP_CACHE_OPTIMIZER_*` / `OMP_CACHE_RETENTION`；读取兼容旧 `PI_*`，长缓存写入时同步镜像 `PI_CACHE_RETENTION` 供宿主
 
 ### Compat Field Mapping (Legacy → OMP)
 
@@ -76,15 +74,11 @@ OMP Runtime (host, Bun-based)
 
 Each `CacheProviderAdapter` defines: `id`, `label`, `matchesModel(model)`, `matchesAssistantMessage(message, model)`, `normalizeUsage(message)`, `warningText(model)` (single argument — derives key internally via `modelKey(model)`), `showCacheWrite`.
 
-### Prompt Optimization Pipeline (in `before_provider_request`)
+### Prompt Optimization Pipeline (in `before_agent_start`)
 
-1. `stripSessionOverviewChurn()` — remove per-turn timestamps/task status from `<session-overview>`
-2. `compressSkillsInSystemPrompt()` — replace verbose `<available_skills>` XML with compact index (min 4 skills)
-3. `optimizeSystemPrompt()` — lift stable candidates (guidelines, tool snippets, context files) above dynamic content
+1. `stripSessionOverviewChurn()` — 逐块移除 `<session-overview>` 中的易变字段（RECENT COMMITS、Working directory、Line count），保持块顺序与 skill 描述逐字不变。不压缩 skills、不重排块。
 
-Integrity guard: WORM-flag `promptTruncationDetected` detects if structural markers were lost during rewrite.
-
-**Bypass**: All prompt mutations skipped for `openai-codex-responses` / `openai-responses` / `azure-openai-responses` APIs (server-managed caching + stricter content-safety filtering).
+`before_provider_request` 安全网：若 `before_agent_start` 未跑或被覆盖，对 payload 中的 system prompt 兜底 strip session-overview churn；并按 400-history 与 compat 对 `prompt_cache_retention` 做安全 strip。不注入 `prompt_cache_key`。
 
 ### `/cache-optimizer fix` — Current Status
 
@@ -92,19 +86,17 @@ Integrity guard: WORM-flag `promptTruncationDetected` detects if structural mark
 
 The original project's auto-write safety protocol (backup → preview + confirmation → atomic temp+rename → post-write self-check → restore-from-backup on failure) will be reimplemented for YAML in a follow-up.
 
-### `PI_CACHE_RETENTION` Mechanism
+### `OMP_CACHE_RETENTION` 机制
 
-The extension sets `PI_CACHE_RETENTION=long` at load time (OMP honors this env var — see omp environment-variables.md §2). `/cache-optimizer disable` restores the startup value for the current OMP process.
+扩展加载时设置 `OMP_CACHE_RETENTION=long`，并同步写入 `PI_CACHE_RETENTION=long`（宿主 `@oh-my-pi/pi-ai` 的 `resolveCacheRetention` 仍读 `PI_`）。`/cache-optimizer disable` 恢复当前 OMP 进程启动时的值。
 
-### Environment Variable Gating
+### 环境变量开关
 
-| Variable | Effect |
+| 变量 | 作用 |
 |---|---|
-| `PI_CACHE_OPTIMIZER_NO_PROMPT_REWRITE=1` | Disable prompt mutations only |
-| `PI_CACHE_OPTIMIZER_NO_SKILL_COMPRESSION=1` | Keep verbose skill XML |
-| `PI_CACHE_OPTIMIZER_NO_OPENAI_CACHE_KEY=1` | Disable prompt_cache_key fallback |
+| `OMP_CACHE_OPTIMIZER_NO_PROMPT_REWRITE=1` | 关闭 prompt 改写（session-overview churn strip） |
 
-OMP mirrors `OMP_CACHE_OPTIMIZER_*` → `PI_CACHE_OPTIMIZER_*` automatically, so either prefix works.
+旧 `PI_CACHE_OPTIMIZER_*` 前缀读取时仍兼容。
 
 ## Important Files
 
@@ -126,11 +118,11 @@ OMP mirrors `OMP_CACHE_OPTIMIZER_*` → `PI_CACHE_OPTIMIZER_*` automatically, so
 
 ## Testing & QA
 
-- **No test framework**: Tests are hand-written `verify.ts` scripts under `.trellis/tasks/archive/<date>/<task>/`
-- **Run with Bun**: `bun .trellis/tasks/archive/<date>/<task>/verify.ts` (scripts use `#!/usr/bin/env bun` shebang)
-- **Verification pattern**: Each script imports `__internals_for_tests` from `index.ts` (~150 exported helpers covering adapters, stats, JSONC/YAML editors, routing protocol, model detection, persistence, fix helpers), runs assertions with `expect(label, condition, message)`, and exits 0/1
+- **No test framework**: Tests live in `smoke-test.ts` (root), no `src/` tree.
+- **Run with Bun**: `bun smoke-test.ts` (shebang `#!/usr/bin/env bun`).
+- **Verification pattern**: `smoke-test.ts` imports `__internals_for_tests` from `index.ts` and the default export, constructs a minimal `ExtensionAPI` harness that captures real `before_agent_start` / `before_provider_request` handlers, and runs assertions with `expect(label, condition, message)`; exits 0/1.
 - **Required checks before delivery**:
-  1. `bunx tsc --noEmit` — no type errors
-  2. `npm pack --dry-run` — package includes correct files
-  3. Task-specific `verify.ts` — all assertions pass
+  1. `bun smoke-test.ts` — all assertions pass
+  2. `bunx tsc --noEmit` — no type errors
+  3. `npm pack --dry-run` — package includes correct files
 - **Forbidden**: logging secrets, writing `models.yml` outside `/cache-optimizer fix` flow, adapter selection by provider/api alone, non-actionable startup warnings, `any` casts without runtime guards, throwing from hook paths
