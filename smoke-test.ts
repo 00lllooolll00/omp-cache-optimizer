@@ -633,6 +633,23 @@ expect(
     (fallbackPayload.prompt_cache_key as string) === "x".repeat(64),
   `无 header 时应 fallback 到 sessionId 并截断到 64 字符，实际: ${JSON.stringify(fallbackPayload.prompt_cache_key)}`,
 );
+// 3e. 超长 host header key：OpenAI body 必须截断，但 cache hint 必须保留完整 key。
+const longHeaderKey = `header-${"y".repeat(80)}`;
+const longHeaderCtx = makeContext({ sessionManager: { getSessionId: () => "fallback-session-id", getHeader: () => ({ providerPromptCacheKey: longHeaderKey }) } });
+const longHeaderPayload: Record<string, unknown> = { model: "gpt-test", messages: [] };
+harness.runBeforeProviderRequest({ payload: longHeaderPayload }, longHeaderCtx);
+expect(
+  "before_provider_request.clamps-long-header-key-for-openai-body",
+  typeof longHeaderPayload.prompt_cache_key === "string" && (longHeaderPayload.prompt_cache_key as string).length === 64,
+  `OpenAI body key 应截断到 64 字符，实际: ${JSON.stringify(longHeaderPayload.prompt_cache_key)}`,
+);
+await harness.runBeforeAgentStart({ type: "before_agent_start", prompt: "hi", systemPrompt: [primaryBlock] }, longHeaderCtx);
+const longHeaderHint = __internals_for_tests.getCacheHintsService()?.getHints({});
+expect(
+  "cache-hints.preserve-full-long-header-key",
+  longHeaderHint?.promptCacheKey === longHeaderKey,
+  `cache hint 应保留完整 host key，实际: ${JSON.stringify(longHeaderHint?.promptCacheKey)}`,
+);
 // 3e. 运行时禁用（/cache-optimizer disable）时不注入
 const prevEnabled = __internals_for_tests.isRuntimeOptimizerEnabled();
 __internals_for_tests.setRuntimeOptimizerEnabled(false);
@@ -645,6 +662,7 @@ expect(
 );
 __internals_for_tests.setRuntimeOptimizerEnabled(prevEnabled);
 
+await harness.runBeforeAgentStart({ type: "before_agent_start", prompt: "hi", systemPrompt: [primaryBlock] }, providerCtx);
 // 5. cache hints：优先使用 OMP 17 header 的 providerPromptCacheKey，缺失时 fallback session id
 const hintService = __internals_for_tests.getCacheHintsService();
 const hint1 = hintService?.getHints({});

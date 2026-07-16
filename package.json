@@ -1,6 +1,6 @@
 {
   "name": "omp-cache-optimizer",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "Improve OMP prompt/KV cache hit rates with safer prompt churn cleanup, proxy compat warnings, and footer cache stats.",
   "keywords": [
     "omp-package",

@@ -407,14 +407,13 @@ function clampPromptCacheKey(key: string | undefined): string | undefined {
 
 function getSessionPromptCacheKey(ctx: ExtensionContext): string | undefined {
   // OMP 17：宿主解析 provider-facing cache key（header.providerPromptCacheKey ?? sessionId）。
-  // 插件读取该 key 有两个用途：(1) 扩展间 cache hint 协议；(2) before_provider_request
-  // 中为 OpenAI-compatible API（host 不注入的 openai-completions chat wire）兜底写入 body
-  // prompt_cache_key。两路都经 clampPromptCacheKey 截断到 64 字符以避免 OpenAI 400。
+  // cache hint 协议必须保留完整 key，防止不同长 key 因相同前缀被错误合并；仅 OpenAI
+  // request body 受 64 字符限制，注入时再通过 clampPromptCacheKey 截断。
   const header = ctx.sessionManager.getHeader?.();
   const providerPromptCacheKey = asRecord(header)?.providerPromptCacheKey;
-  if (isNonEmptyString(providerPromptCacheKey)) return clampPromptCacheKey(providerPromptCacheKey as string);
-  const sessionId = ctx.sessionManager.getSessionId();
-  return clampPromptCacheKey(sessionId);
+  if (isNonEmptyString(providerPromptCacheKey)) return (providerPromptCacheKey as string).trim();
+  const sessionId = ctx.sessionManager.getSessionId().trim();
+  return sessionId || undefined;
 }
 
 /**
@@ -4818,7 +4817,7 @@ export default function (pi: ExtensionAPI) {
     // body parameter and isOpenAICompatibleApi excludes them.
     if (runtimeOptimizerEnabled && isOpenAICompatibleApi(requestModel?.api)) {
       const payloadRecord = asRecord(resultPayload);
-      const cacheKey = getSessionPromptCacheKey(ctx);
+      const cacheKey = clampPromptCacheKey(getSessionPromptCacheKey(ctx));
       if (
         payloadRecord &&
         isNonEmptyString(cacheKey) &&
