@@ -1,35 +1,69 @@
 import { createHash } from "node:crypto";
 import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
-import type { BuildSystemPromptOptions, ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import { join } from "node:path";
+import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 
 type MutableEnv = Record<string, string | undefined>;
 
 type CacheRetentionEnvSnapshot = {
+  /** 启动时是否已设置 OMP_CACHE_RETENTION 或兼容的 PI_CACHE_RETENTION */
   wasSet: boolean;
   value?: string;
+  /** 启动时是否存在 OMP_ 键（用于 disable 时精确恢复） */
+  ompWasSet: boolean;
+  ompValue?: string;
+  /** 启动时是否存在 PI_ 键（宿主 pi-ai 仍读此名） */
+  piWasSet: boolean;
+  piValue?: string;
 };
 
+/** 扩展侧主环境变量名（用户应使用 OMP_ 前缀） */
+const OMP_CACHE_RETENTION_ENV = "OMP_CACHE_RETENTION";
+/** 宿主 @oh-my-pi/pi-ai 仍读取 PI_CACHE_RETENTION；写入时同步镜像 */
 const PI_CACHE_RETENTION_ENV = "PI_CACHE_RETENTION";
 const LONG_CACHE_RETENTION_VALUE = "long";
 
+function readCacheRetentionValue(env: MutableEnv): string | undefined {
+  // 优先 OMP_，兼容旧 PI_
+  const omp = env[OMP_CACHE_RETENTION_ENV];
+  if (typeof omp === "string" && omp.length > 0) return omp;
+  const pi = env[PI_CACHE_RETENTION_ENV];
+  if (typeof pi === "string" && pi.length > 0) return pi;
+  return undefined;
+}
+
 function captureCacheRetentionEnv(env: MutableEnv = process.env): CacheRetentionEnvSnapshot {
+  const ompWasSet = Object.prototype.hasOwnProperty.call(env, OMP_CACHE_RETENTION_ENV);
+  const piWasSet = Object.prototype.hasOwnProperty.call(env, PI_CACHE_RETENTION_ENV);
   return {
-    wasSet: Object.prototype.hasOwnProperty.call(env, PI_CACHE_RETENTION_ENV),
-    value: env[PI_CACHE_RETENTION_ENV],
+    wasSet: ompWasSet || piWasSet,
+    value: readCacheRetentionValue(env),
+    ompWasSet,
+    ompValue: env[OMP_CACHE_RETENTION_ENV],
+    piWasSet,
+    piValue: env[PI_CACHE_RETENTION_ENV],
   };
 }
 
 function requestLongCacheRetention(env: MutableEnv = process.env): void {
-  if (!env[PI_CACHE_RETENTION_ENV] || env[PI_CACHE_RETENTION_ENV] !== LONG_CACHE_RETENTION_VALUE) {
+  // 同时写 OMP_（用户可见主名）与 PI_（宿主 resolveCacheRetention 依赖）
+  if (env[OMP_CACHE_RETENTION_ENV] !== LONG_CACHE_RETENTION_VALUE) {
+    env[OMP_CACHE_RETENTION_ENV] = LONG_CACHE_RETENTION_VALUE;
+  }
+  if (env[PI_CACHE_RETENTION_ENV] !== LONG_CACHE_RETENTION_VALUE) {
     env[PI_CACHE_RETENTION_ENV] = LONG_CACHE_RETENTION_VALUE;
   }
 }
 
 function restoreCacheRetentionEnv(snapshot: CacheRetentionEnvSnapshot, env: MutableEnv = process.env): void {
-  if (snapshot.wasSet) {
-    env[PI_CACHE_RETENTION_ENV] = snapshot.value;
+  if (snapshot.ompWasSet) {
+    env[OMP_CACHE_RETENTION_ENV] = snapshot.ompValue;
+  } else {
+    delete env[OMP_CACHE_RETENTION_ENV];
+  }
+  if (snapshot.piWasSet) {
+    env[PI_CACHE_RETENTION_ENV] = snapshot.piValue;
   } else {
     delete env[PI_CACHE_RETENTION_ENV];
   }
@@ -38,21 +72,21 @@ function restoreCacheRetentionEnv(snapshot: CacheRetentionEnvSnapshot, env: Muta
 const STARTUP_CACHE_RETENTION_ENV = captureCacheRetentionEnv();
 
 /**
- * OMP Cache Optimizer (fork of pi-cache-optimizer for oh-my-pi)
+ * OMP Cache Optimizer（pi-cache-optimizer 的 oh-my-pi 适配 fork）
  *
- * What it does:
- * 1. Reorders OMP's system prompt so stable content is sent before dynamic context.
- * 2. Sets PI_CACHE_RETENTION=long at extension load time (OMP honors the same env).
- * 3. Warns once for provider/model cache compat gaps where the signal is conservative.
- * 4. Shows lightweight persisted provider-specific cache stats in OMP's footer.
+ * 功能：
+ * 1. 重排 OMP system prompt，使稳定内容位于动态上下文之前。
+ * 2. 加载时设置 OMP_CACHE_RETENTION=long（并镜像 PI_CACHE_RETENTION 供宿主读取）。
+ * 3. 在信号保守的前提下，对 provider/model 缓存 compat 缺口做一次性提醒。
+ * 4. 在 OMP footer 显示按 provider 区分的轻量持久化缓存统计。
  *
- * Provider prompt/KV caches are provider-side and best-effort. This extension improves
- * the odds of cache hits; it cannot guarantee hits, especially through proxies.
+ * Provider 侧 prompt/KV 缓存为 best-effort。本扩展提高命中概率，
+ * 尤其经代理时无法保证命中。
  */
 
 // ============================================================
-// Automatically request long prompt-cache retention when OMP supports it.
-// /cache-optimizer disable restores the startup value for this OMP process.
+// 在 OMP 支持时自动请求长 prompt-cache 保留。
+// /cache-optimizer disable 会恢复本 OMP 进程启动时的值。
 // ============================================================
 requestLongCacheRetention();
 
@@ -64,74 +98,20 @@ const LOG_PREFIX = "omp-cache-optimizer";
 const STATUS_KEY = "omp-cache-stats";
 const STATE_DIR = join(homedir(), ".omp", "agent");
 const STATE_FILE_PATH = join(STATE_DIR, "omp-cache-optimizer-stats.json");
-// Legacy source-project state file path: read for one-way migration only, never written.
+// 旧版源项目状态路径：仅用于单向迁移读取，从不写入。
 const LEGACY_PI_STATE_FILE_PATH = join(homedir(), ".pi", "agent", "pi-cache-optimizer-stats.json");
 const LEGACY_STATE_FILE_PATH = join(STATE_DIR, "deepseek-cache-optimizer-stats.json");
 const CACHE_PROVIDER_IDS: CacheProviderId[] = ["deepseek", "openai", "claude", "gemini"];
-// Env var names keep the PI_CACHE_OPTIMIZER_* prefix: OMP mirrors OMP_* -> PI_* in
-// every .env file (see omp environment-variables.md §2), so these remain the single
-// source of truth and OMP_CACHE_OPTIMIZER_* aliases resolve transparently.
-const OPENAI_CACHE_KEY_ENV = "PI_CACHE_OPTIMIZER_OPENAI_CACHE_KEY";
-const NO_OPENAI_CACHE_KEY_ENV = "PI_CACHE_OPTIMIZER_NO_OPENAI_CACHE_KEY";
-const OPENAI_PROMPT_CACHE_KEY_MAX_LENGTH = 64;
-const NO_SKILL_COMPRESSION_ENV = "PI_CACHE_OPTIMIZER_NO_SKILL_COMPRESSION";
-const NO_PROMPT_REWRITE_ENV = "PI_CACHE_OPTIMIZER_NO_PROMPT_REWRITE";
-// Inter-extension protocol symbols are versioned under the omp.* namespace. The v1
-// shape is identical to the legacy symbols; router/hints integrators on OMP
-// should register under omp.routing.registry.v1 / omp.cache.hints.v1.
+// 扩展自身开关统一使用 OMP_CACHE_OPTIMIZER_* 前缀。
+// 读取时仍兼容旧 PI_CACHE_OPTIMIZER_*（OMP 加载 .env 时也会把 OMP_* 镜像为 PI_*）。
+const NO_PROMPT_REWRITE_ENV = "OMP_CACHE_OPTIMIZER_NO_PROMPT_REWRITE";
+const NO_PROMPT_REWRITE_ENV_LEGACY = "PI_CACHE_OPTIMIZER_NO_PROMPT_REWRITE";
+// 扩展间协议符号使用 omp.* 命名空间版本化。v1 形状与旧符号一致；
+// OMP 上的 router/hints 集成方应注册 omp.routing.registry.v1 / omp.cache.hints.v1。
 const PI_ROUTING_REGISTRY_SYMBOL = Symbol.for("omp.routing.registry.v1");
 const PI_CACHE_HINTS_SYMBOL = Symbol.for("omp.cache.hints.v1");
 
 let runtimeOptimizerEnabled = true;
-
-// WORM-flag: if optimizeSystemPrompt ever detects that its blind-replace
-// logic has accidentally truncated a structural marker (any XML tag or
-// HTML comment boundary marker present in the original prompt), we flip
-// this. publishStatus reads it once, appends a footer warning, then
-// resets it. The flag surface is kept separate from the regular
-// cache-stats counter so that a one-turn glitch doesn't poison the
-// persisted metrics.
-let promptTruncationDetected = false;
-
-// Timestamp (ms) of the most recent integrity truncation event.
-// Used by /cache-optimizer doctor to surface recovery guidance.
-// Reset to 0 on reload.
-let lastPromptIntegrityWarningAt = 0;
-
-/** Getter for lastPromptIntegrityWarningAt (exported for tests via __internals_for_tests). */
-function getLastPromptIntegrityWarningAt(): number {
-  return lastPromptIntegrityWarningAt;
-}
-
-// Minimum count of skills before compression is worth applying.
-// Below this, the runtime's verbose XML block is small enough that the overhead of
-// an additional one-line index isn't worth the loss of per-skill
-// description hints. The 31-skill snapshot in this repo was 13.3 KB; one
-// or two skills is well under 1 KB and not worth touching.
-const SKILL_COMPRESSION_MIN_COUNT = 4;
-
-// Minimum trimmed length for a candidate to qualify as a stable-prefix "part".
-//
-// `optimizeSystemPrompt` removes each accepted candidate from the dynamic
-// remainder via `rest.replace(part, "")`. Short or character-class candidates
-// (think: `S`, `- u`, `- (`, `- }`) match the FIRST occurrence of those bytes
-// anywhere in `rest`, ripping unrelated text out of the prompt and yielding a
-// non-deterministic dynamic remainder per request. Both behaviors poison the
-// provider's prompt-prefix cache.
-//
-// The threshold also caps the upstream string-vs-array regression we saw with
-// trellis 0.5.16 / 0.6.0-beta.17 (subagent tool registration passing
-// `promptGuidelines: "<long string>"` instead of `["<long string>"]`, which
-// the runtime then iterates char-by-char). Even if a similar bug recurs upstream, this
-// extension will not lift its single-character byproducts into the stable
-// prefix candidate list.
-//
-// 8 chars is comfortably above all single-bullet (`- X` = 3 chars) and
-// short-token noise while leaving every legitimate guideline / tool snippet /
-// context-file payload above the bar. If a real future guideline is shorter
-// than 8 chars, the cost is that it is not lifted into the stable prefix; the
-// dynamic-remainder path still includes it untouched.
-const MIN_STABLE_CANDIDATE_LENGTH = 8;
 
 const ASSISTANT_MESSAGE_MODEL_TOKEN_KEYS = ["model", "name"];
 const OPENAI_REASONING_MODEL_PATTERN = /(^|[/\s:_-])o[1345]($|[-_.:/\s])/;
@@ -292,12 +272,6 @@ type UsageSnapshot = {
   totalInput: number;
 };
 
-type OptimizedSystemPrompt = {
-  systemPrompt: string;
-  stablePrefix: string;
-  changed: boolean;
-};
-
 /**
  * Per-request sample stored for trend analysis and usage-field-missing detection.
  * Contains only numeric counters and booleans — never message content, prompts,
@@ -313,7 +287,6 @@ type CacheUsageSample = {
 };
 
 type PromptRewriteContext = {
-  options?: BuildSystemPromptOptions;
   routeSnapshot?: PiRouteSnapshot;
   routedModel?: PiModel;
   timestamp: number;
@@ -333,211 +306,6 @@ type CacheProviderAdapter = {
   normalizeUsage(message: unknown): UsageSnapshot | undefined;
   warningText?(model: PiModel): string | undefined;
 };
-
-function escapeXml(value: string): string {
-  return value
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/\"/g, "&quot;")
-    .replace(/'/g, "&apos;");
-}
-
-function isStableContextFilePath(filePath: string): boolean {
-  const normalized = filePath.replace(/\\/g, "/").toLowerCase();
-  const name = normalized.split("/").pop();
-
-  return (
-    name === "agents.md" ||
-    name === "claude.md" ||
-    name === "gemini.md" ||
-    name === "cursor.md" ||
-    normalized.startsWith(".trellis/spec/") ||
-    normalized.includes("/.trellis/spec/")
-  );
-}
-
-function formatSkillsForPrompt(skills: NonNullable<BuildSystemPromptOptions["skills"]>): string {
-  const visibleSkills = skills.filter((skill) => !skill.disableModelInvocation);
-  if (visibleSkills.length === 0) return "";
-
-  const lines = [
-    "\n\nThe following skills provide specialized instructions for specific tasks.",
-    "Use the read tool to load a skill's file when the task matches its description.",
-    "When a skill file references a relative path, resolve it against the skill directory (parent of SKILL.md / dirname of the path) and use that absolute path in tool commands.",
-    "",
-    "<available_skills>",
-  ];
-
-  for (const skill of visibleSkills) {
-    lines.push("  <skill>");
-    lines.push(`    <name>${escapeXml(skill.name)}</name>`);
-    lines.push(`    <description>${escapeXml(skill.description)}</description>`);
-    lines.push(`    <location>${escapeXml(skill.filePath)}</location>`);
-    lines.push("  </skill>");
-  }
-
-  lines.push("</available_skills>");
-  return lines.join("\n");
-}
-
-/**
- * Compressed alternative to `formatSkillsForPrompt`.
- *
- * The host runtime emits a four-line XML block per skill (`<name>`, `<description>`,
- * `<location>`) plus a three-sentence preamble. With 31 skills active in
- * this repo that block measured 13.3 KB — 61.5 % of the total system
- * prompt. The full description text matters when the model has to decide
- * which skill to load, but the model can read SKILL.md on demand: the
- * names alone plus a known location pattern is enough to identify
- * candidates.
- *
- * This compressed form preserves:
- *   1. The instruction to read SKILL.md when a task matches a skill name.
- *   2. The relative-path resolution rule (parent of SKILL.md is the
- *      skill directory).
- *   3. Discoverability of every skill: name + location prefix per skill.
- *
- * It drops:
- *   - Per-skill description text (model loads it via `read` when a name
- *     matches a task).
- *   - The `<available_skills>` XML envelope and per-skill XML overhead
- *     (~110 bytes per skill of pure structure, plus the location path).
- *
- * Output shape is a single text block grouped by skill-root directory so
- * the model can compute each skill's full path by name. Names are sorted
- * alphabetically within each group for determinism (cache stability).
- */
-function formatSkillsForPromptCompressed(
-  skills: NonNullable<BuildSystemPromptOptions["skills"]>,
-): string {
-  const visibleSkills = skills.filter((skill) => !skill.disableModelInvocation);
-  if (visibleSkills.length === 0) return "";
-
-  const groups = new Map<string, string[]>();
-  for (const skill of visibleSkills) {
-    // skill.filePath = .../<skill-name>/SKILL.md, so dirname is the
-    // skill directory and dirname-of-dirname is the skills root.
-    const skillDir = dirname(skill.filePath);
-    const root = dirname(skillDir);
-    const list = groups.get(root) ?? [];
-    list.push(skill.name);
-    groups.set(root, list);
-  }
-
-  // Sort group entries by root for determinism: same skill set under the
-  // same roots must always produce the same string, otherwise the
-  // provider prompt-prefix cache loses on prompt builder runs that
-  // happened to iterate the underlying Map in different orders.
-  const sortedGroups = [...groups.entries()].sort(([a], [b]) =>
-    a < b ? -1 : a > b ? 1 : 0,
-  );
-
-  const lines: string[] = [
-    "",
-    "",
-    "The following skills provide specialized instructions for specific tasks. When a skill name matches the task you are doing, read the SKILL.md at the listed location to load the full instructions. When a SKILL.md references a relative path, resolve it against the skill directory (parent of SKILL.md / dirname of the path) and use that absolute path in tool commands.",
-  ];
-
-  for (const [root, names] of sortedGroups) {
-    names.sort();
-    lines.push("");
-    lines.push(`Skills under ${root}/<name>/SKILL.md:`);
-    // Wrap the name list at ~80 columns for readability without
-    // affecting determinism. Each line is `  name1, name2, name3,`.
-    let buf = "  ";
-    for (let i = 0; i < names.length; i++) {
-      const name = names[i];
-      const piece = (buf === "  " ? "" : ", ") + name;
-      if (buf.length > 2 && buf.length + piece.length > 80) {
-        lines.push(`${buf},`);
-        buf = `  ${name}`;
-      } else {
-        buf += piece;
-      }
-    }
-    if (buf.length > 2) lines.push(buf);
-  }
-
-  return lines.join("\n");
-}
-
-/**
- * Replace the runtime's verbose `<available_skills>` block in `prompt` with the
- * compressed one-index form. Idempotent: if the verbose form is not
- * present (compression already applied, or skill count below threshold),
- * the prompt is returned unchanged.
- *
- * Opt-out: set `PI_CACHE_OPTIMIZER_NO_SKILL_COMPRESSION=1`.
- *
- * Pre-conditions for compression to fire:
- *   - opts.skills present and visible-skill count >= SKILL_COMPRESSION_MIN_COUNT
- *   - Verbose block (built from the same `opts.skills`) is found in
- *     `prompt` (substring match, no regex). This anchors the substitution
- *     to the runtime's own emitter; if the format changes, we no-op rather
- *     than mangle.
- */
-function compressSkillsInSystemPrompt(
-  prompt: string,
-  opts: BuildSystemPromptOptions,
-): string {
-  if (isEnabledEnv(process.env[NO_SKILL_COMPRESSION_ENV])) return prompt;
-  if (!opts.skills || opts.skills.length === 0) return prompt;
-
-  const visible = opts.skills.filter((skill) => !skill.disableModelInvocation);
-  if (visible.length < SKILL_COMPRESSION_MIN_COUNT) return prompt;
-
-  const verbose = formatSkillsForPrompt(opts.skills);
-  if (!verbose || !prompt.includes(verbose)) return prompt;
-
-  const compressed = formatSkillsForPromptCompressed(opts.skills);
-  if (!compressed || compressed.length >= verbose.length) return prompt;
-
-  return prompt.replace(verbose, compressed);
-}
-
-function buildStableCandidates(opts: BuildSystemPromptOptions): string[] {
-  const candidates: string[] = [];
-
-  if (opts.customPrompt) candidates.push(opts.customPrompt);
-  if (opts.appendSystemPrompt) candidates.push(opts.appendSystemPrompt);
-
-  const tools = opts.selectedTools ?? ["read", "bash", "edit", "write"];
-  const toolLines = tools
-    .filter((name) => opts.toolSnippets?.[name])
-    .map((name) => `- ${name}: ${opts.toolSnippets?.[name]}`);
-  if (toolLines.length > 0) {
-    candidates.push(`Available tools:\n${toolLines.join("\n")}`);
-  }
-
-  for (const guideline of opts.promptGuidelines ?? []) {
-    const normalized = guideline.trim();
-    if (normalized.length > 0) candidates.push(`- ${normalized}`);
-  }
-
-  for (const file of opts.contextFiles ?? []) {
-    // Provider caches work best when stable instructions are part of the earliest prefix.
-    // Only lift known-stable project/spec instruction files. Dynamic task/session context
-    // can be large too, so size alone must never make a context file cache-prefix material.
-    if (!isStableContextFilePath(file.path)) continue;
-    candidates.push(`## ${file.path}\n\n${file.content}`);
-    candidates.push(file.content);
-  }
-
-  if (opts.skills && opts.skills.length > 0) {
-    // Push BOTH forms so `optimizeSystemPrompt` finds whichever is
-    // actually present in the prompt. The `rest.includes(part)`
-    // short-circuit skips the form that isn't there. The two strings
-    // are mutually distinguishable (the verbose form contains the
-    // literal `<available_skills>` envelope; the compressed form
-    // contains `Skills under ` and no XML tags) so they cannot
-    // accidentally match each other.
-    candidates.push(formatSkillsForPrompt(opts.skills));
-    candidates.push(formatSkillsForPromptCompressed(opts.skills));
-  }
-
-  return candidates;
-}
 
 /**
  * Strip per-turn churn from trellis `<session-overview>` block.
@@ -586,140 +354,40 @@ function stripSessionOverviewChurn(prompt: string): string {
   return before + cleaned + after;
 }
 
-/**
- * Extract structural markers from a prompt for the integrity guard.
- *
- * The guard runs in `optimizeSystemPrompt` to catch cases where the
- * blind `rest.replace(part, "")` reorder accidentally eats text inside
- * an extension-injected structural block (e.g., trellis
- * `<workflow-state>`, a hypothetical `<task-tracker>`, or AGENTS.md
- * `<!-- TRELLIS:START -->` markers). When the original prompt contains
- * a marker that the result is missing, we fall back to the original
- * prompt rather than ship a corrupted one.
- *
- * Three marker categories are recognized (covers ~99% of real-world
- * extension injection patterns in the host runtime ecosystem):
- *
- *   1. XML-style opening tags  `<tagname>` (lowercase, alpha-num + `_`/`-`)
- *   2. XML-style closing tags  `</tagname>`
- *   3. HTML comment START/END  `<!-- NAME:START -->` / `<!-- NAME:END -->`
- *
- * Tags with attributes (e.g., `<task id="42">`) are not currently emitted
- * by any runtime extension we know of and are skipped to keep the regex tight.
- * Markdown headers, horizontal rules, and timestamp patterns are not
- * usable as guards because they have no closing form to verify.
- *
- * The check is deliberately set-based (presence/absence) rather than
- * count-based: a single occurrence per request is the universal
- * convention, and a count drop with the same set of unique tags would
- * be a different class of bug not catchable here.
- */
-function extractStructuralMarkers(prompt: string): {
-  openingTags: Set<string>;
-  closingTags: Set<string>;
-  commentMarkers: Set<string>;
-} {
-  const openingTags = new Set<string>();
-  const closingTags = new Set<string>();
-  const commentMarkers = new Set<string>();
+// ── OMP 17 系统 prompt 块数组工具 ──────────────────────────────
+// 主重写路径操作 before_agent_start 给出的 string[] 块。
+// join 仅用于 cache hint 展示，不用于再拆分。
 
-  // Opening tags: <tagname> with no attributes and no leading slash.
-  // Tagname must start with a letter and contain only alpha-num, `-`, `_`.
-  for (const match of prompt.matchAll(/<([a-z][a-z0-9_-]*)>/gi)) {
-    openingTags.add(match[1].toLowerCase());
-  }
-  // Closing tags: </tagname>
-  for (const match of prompt.matchAll(/<\/([a-z][a-z0-9_-]*)>/gi)) {
-    closingTags.add(match[1].toLowerCase());
-  }
-  // HTML comments with NAME:START or NAME:END inside.
-  // Trellis emits `<!-- TRELLIS:START -->` / `<!-- TRELLIS:END -->` in
-  // the AGENTS.md managed block; other extensions follow this convention.
-  for (const match of prompt.matchAll(/<!--\s*([A-Z][A-Z0-9_-]*):(START|END)\s*-->/g)) {
-    commentMarkers.add(`${match[1]}:${match[2]}`);
-  }
-
-  return { openingTags, closingTags, commentMarkers };
+function joinSystemPromptBlocks(blocks: string[]): string {
+  return blocks.filter((b) => typeof b === "string" && b.length > 0).join("\n\n");
 }
 
-function optimizeSystemPrompt(
-  original: string,
-  opts: BuildSystemPromptOptions,
-): OptimizedSystemPrompt {
-  const stableParts: string[] = [];
-  const seen = new Set<string>();
-  let rest = original;
-
-  // Stable layer: content likely to be identical across sessions/turns.
-  // Short / single-char candidates are dropped: see MIN_STABLE_CANDIDATE_LENGTH.
-  for (const candidate of buildStableCandidates(opts)) {
-    const part = candidate.trim();
-    if (!part || part.length < MIN_STABLE_CANDIDATE_LENGTH) continue;
-    if (seen.has(part) || !rest.includes(part)) continue;
-
-    stableParts.push(part);
-    seen.add(part);
-    rest = rest.replace(part, "");
-  }
-
-  const stablePrefix = stableParts.join("\n\n");
-
-  // Dynamic layer: git status, active task context, recent session context, etc.
-  const dynamicRemainder = rest.trim();
-
-  if (stableParts.length === 0) {
-    return { systemPrompt: original, stablePrefix: "", changed: false };
-  }
-
-  const systemPrompt =
-    stablePrefix +
-    (dynamicRemainder.length > 0 ? "\n\n---\n\n" + dynamicRemainder : "");
-
-  // Sanity check: scan ALL structural markers (XML tags + HTML comment
-  // boundary markers) in the original and verify each one survives the
-  // reorder. If any marker drops, the blind `rest.replace(part, "")`
-  // logic ate something it shouldn't have — fall back to the original
-  // prompt and flag the footer warning. This is provider-agnostic and
-  // extension-agnostic: trellis `<workflow-state>`, a hypothetical
-  // `<task-tracker>`, AGENTS.md `<!-- TRELLIS:START -->`, etc., are all
-  // protected without code changes when new extensions ship.
-  //
-  // Our skills compression runs BEFORE optimizeSystemPrompt and replaces
-  // the runtime's verbose `<available_skills>` block with a compressed text
-  // section that has no XML tag. So `original` here (post-compression)
-  // does not contain `<available_skills>` and the result doesn't either
-  // — no false positive.
-  const originalMarkers = extractStructuralMarkers(original);
-  const resultMarkers = extractStructuralMarkers(systemPrompt);
-
-  const missing =
-    [...originalMarkers.openingTags].some((tag) => !resultMarkers.openingTags.has(tag)) ||
-    [...originalMarkers.closingTags].some((tag) => !resultMarkers.closingTags.has(tag)) ||
-    [...originalMarkers.commentMarkers].some((m) => !resultMarkers.commentMarkers.has(m));
-
-  if (missing) {
-    promptTruncationDetected = true;
-    return { systemPrompt: original, stablePrefix: "", changed: false };
-  }
-
-  return {
-    systemPrompt,
-    stablePrefix,
-    changed: true,
-  };
+function mapSystemPromptBlocks(blocks: string[], mapFn: (block: string, index: number) => string): string[] {
+  return blocks.map((block, index) => {
+    if (typeof block !== "string") return block;
+    const next = mapFn(block, index);
+    // 防止整块被 map 成空串后误删。
+    if (typeof next !== "string" || next.trim().length === 0) return block;
+    return next;
+  });
 }
 
-function clampPromptCacheKey(key: string | undefined): string | undefined {
-  const normalized = key?.trim();
-  if (!normalized) return undefined;
-
-  const chars = Array.from(normalized);
-  if (chars.length <= OPENAI_PROMPT_CACHE_KEY_MAX_LENGTH) return normalized;
-  return chars.slice(0, OPENAI_PROMPT_CACHE_KEY_MAX_LENGTH).join("");
+function systemPromptBlocksEqual(a: string[], b: string[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
 }
 
 function getSessionPromptCacheKey(ctx: ExtensionContext): string | undefined {
-  return clampPromptCacheKey(ctx.sessionManager.getSessionId());
+  // OMP 17：provider-facing cache key 由宿主解析（providerPromptCacheKey ?? providerSessionId ?? sessionId）。
+  // 插件只读取最终 header key 供扩展间 cache hint 协议，不再向 provider payload 注入 body key。
+  const header = ctx.sessionManager.getHeader?.();
+  const providerPromptCacheKey = asRecord(header)?.providerPromptCacheKey;
+  if (isNonEmptyString(providerPromptCacheKey)) return (providerPromptCacheKey as string).trim();
+  const sessionId = ctx.sessionManager.getSessionId();
+  return isNonEmptyString(sessionId) ? sessionId.trim() : undefined;
 }
 
 /**
@@ -1016,17 +684,9 @@ function getPromptRewriteContext(
 }
 
 /**
- * Return a platform-friendly display path for `~/.omp/agent/models.yml`.
- *
- * On Windows (platform starts with "win") the path is shown as
- * `%USERPROFILE%\.omp\agent\models.yml` to match Windows conventions.
- * On all other platforms (Linux, macOS, etc.) it is shown as
- * `~/.omp/agent/models.yml` (the Unix-style tilde shorthand).
- *
- * This is a DISPLAY helper only. Actual path resolution is done by OMP
- * (via Node `os.homedir()` + path.join), and this string is never used
- * for I/O — only for warning/doctor/README text so that users on any
- * platform see a copyable path they recognize.
+ * 返回平台友好的 models.yml 展示路径（仅用于文案，不用于 I/O）。
+ * Windows：`%USERPROFILE%\.omp\agent\models.yml`
+ * 其它平台：`~/.omp/agent/models.yml`
  */
 function getModelsYmlDisplayPath(platform: string = process.platform): string {
   if (platform.startsWith("win")) {
@@ -1041,17 +701,15 @@ function isEnabledEnv(value: string | undefined): boolean {
   return normalized === "1" || normalized === "true" || normalized === "yes" || normalized === "on";
 }
 
-function isDisabledEnv(value: string | undefined): boolean {
-  if (!value) return false;
-  const normalized = value.trim().toLowerCase();
-  return normalized === "0" || normalized === "false" || normalized === "no" || normalized === "off";
+/** 读取开关：优先 OMP_ 主名，其次兼容旧 PI_ 名。 */
+function isEnvFlagEnabled(primary: string, legacy: string, env: MutableEnv = process.env): boolean {
+  if (isEnabledEnv(env[primary])) return true;
+  if (isEnabledEnv(env[legacy])) return true;
+  return false;
 }
 
-function shouldInjectOpenAIPromptCacheKey(): boolean {
-  if (!runtimeOptimizerEnabled) return false;
-  if (isEnabledEnv(process.env[NO_OPENAI_CACHE_KEY_ENV])) return false;
-  if (isDisabledEnv(process.env[OPENAI_CACHE_KEY_ENV])) return false;
-  return true;
+function isPromptRewriteDisabled(env: MutableEnv = process.env): boolean {
+  return isEnvFlagEnabled(NO_PROMPT_REWRITE_ENV, NO_PROMPT_REWRITE_ENV_LEGACY, env);
 }
 
 function setRuntimeOptimizerEnabled(enabled: boolean, env: MutableEnv = process.env): void {
@@ -1070,15 +728,15 @@ function isRuntimeOptimizerEnabled(): boolean {
 function getOptimizerRuntimeModeLines(): string[] {
   const state = runtimeOptimizerEnabled ? "已启用" : "已关闭";
   const lines: string[] = [];
+  const retention = readCacheRetentionValue(process.env);
   lines.push(`运行状态：${state}`);
-  lines.push(`• Prompt 重写：${runtimeOptimizerEnabled && !isEnabledEnv(process.env[NO_PROMPT_REWRITE_ENV]) ? "开启" : "关闭"}`);
-  lines.push(`• OpenAI prompt_cache_key 回退：${shouldInjectOpenAIPromptCacheKey() ? "开启" : "关闭"}`);
+  lines.push(`• Prompt 重写：${runtimeOptimizerEnabled && !isPromptRewriteDisabled() ? "开启" : "关闭"}`);
   lines.push(`• Footer 缓存统计：开启${runtimeOptimizerEnabled ? "" : "（对比模式）"}`);
   lines.push(`• Compat 提示：${runtimeOptimizerEnabled ? "开启" : "关闭"}`);
-  lines.push(`• ${PI_CACHE_RETENTION_ENV}：${process.env[PI_CACHE_RETENTION_ENV] ?? "（未设置）"}`);
+  lines.push(`• ${OMP_CACHE_RETENTION_ENV}：${retention ?? "（未设置）"}`);
   if (!runtimeOptimizerEnabled) {
     lines.push("这是当前进程内开关。运行 /reload 或重启 OMP 可恢复到启动时行为。");
-  } else if (isEnabledEnv(process.env[NO_PROMPT_REWRITE_ENV]) || !shouldInjectOpenAIPromptCacheKey()) {
+  } else if (isPromptRewriteDisabled()) {
     lines.push("仍有部分能力被环境变量关闭。");
   }
   return lines;
@@ -1915,29 +1573,14 @@ function normalizeWithFallback(
   return getPiNormalizedUsage(message, options.allowInputOnlyPiUsage) ?? rawNormalizer(message);
 }
 
-function addOpenAIPromptCacheKey(payload: unknown, cacheKey: string | undefined): unknown | undefined {
-  const record = asRecord(payload);
-  const normalizedCacheKey = clampPromptCacheKey(cacheKey);
-  if (!record || !normalizedCacheKey) return undefined;
-
-  if (hasEffectivePromptCacheKey(record)) {
-    return undefined;
-  }
-
-  record.prompt_cache_key = normalizedCacheKey;
-  return record;
-}
-
-// ── System prompt extraction/insertion for before_provider_request ──
+// ── 系统 prompt 提取/写回（payload 安全网） ──
 //
-// OMP divergence: prompt rewriting moved from before_agent_start to
-// before_provider_request. The provider payload shape varies by API:
-//   - openai-completions / openai-responses: payload.messages[] with role=system
-//   - anthropic-messages: payload.system (string or array of blocks)
+// OMP 17：主重写在 before_agent_start（string[] 块）。
+// extractSystemPrompt / setSystemPrompt 仍用于 before_provider_request 的
+// session-overview 安全网与冒烟测试。payload 形态：
+//   - openai-completions / openai-responses: payload.messages[] role=system
+//   - anthropic-messages: payload.system（字符串或块数组）
 //   - google-generative-ai: payload.systemInstruction
-// We probe for each shape and return the first match. setSystemPrompt writes
-// back into the same shape it was extracted from.
-
 function extractSystemPrompt(payload: unknown): string | undefined {
   const record = asRecord(payload);
   if (!record) return undefined;
@@ -2066,9 +1709,6 @@ function setSystemPrompt(payload: unknown, text: string): boolean {
   }
 
   return false;
-}
-function hasEffectivePromptCacheKey(record: UnknownRecord): boolean {
-  return isNonEmptyString(record.prompt_cache_key) || isNonEmptyString(record.promptCacheKey);
 }
 
 function isNonEmptyString(value: unknown): value is string {
@@ -3364,27 +3004,44 @@ function addUsageToCacheStats(stats: CacheStats, usage: UsageSnapshot): void {
 }
 
 function formatTokenCount(value: number): string {
-  const millions = Math.max(0, Math.round(value)) / 1_000_000;
-  if (millions === 0) return "0M";
-  if (millions < 0.001) return `${millions.toFixed(4)}M`;
-  if (millions < 0.01) return `${millions.toFixed(3)}M`;
-  if (millions >= 10) return `${millions.toFixed(1)}M`;
-  return `${millions.toFixed(2)}M`;
+  const n = Math.max(0, Math.round(value));
+  if (n === 0) return "0";
+  if (n < 1000) return String(n);
+  if (n < 10_000) return `${(n / 1000).toFixed(2)}k`;
+  if (n < 1_000_000) return `${(n / 1000).toFixed(1)}k`;
+  const millions = n / 1_000_000;
+  if (millions < 10) return `${millions.toFixed(2)}M`;
+  return `${millions.toFixed(1)}M`;
 }
 
 function localizeAdapterLabel(label: string): string {
   return label.endsWith(" cache") ? `${label.slice(0, -6)} Cache` : label;
 }
 
+/** token 命中率：cachedInputTokens / totalInputTokens，0–100 整数百分比。 */
+function formatTokenHitPercent(stats: CacheStats): string {
+  if (stats.totalInputTokens <= 0) return "—";
+  return `${Math.round((stats.cachedInputTokens / stats.totalInputTokens) * 100)}%`;
+}
+/**
+ * Footer 文案：三项均带中文说明，主指标为 token 命中率。
+ * 例：`OpenAI Cache | 缓存命中率：40% | 缓存请求命中次数：1/2 次 | 缓存token/总输入：800/2.00k`
+ */
 function formatCacheStats(adapter: CacheProviderAdapter, stats: CacheStats): string {
-  const percent = stats.totalInputTokens > 0
-    ? ` (${Math.round((stats.cachedInputTokens / stats.totalInputTokens) * 100)}%)`
-    : "";
+  const tokenHit = formatTokenHitPercent(stats);
+  const tok = `${formatTokenCount(stats.cachedInputTokens)}/${formatTokenCount(stats.totalInputTokens)}`;
+  const req = `${stats.hitRequests}/${stats.totalRequests}`;
   const writeText = adapter.showCacheWrite && stats.cacheWriteInputTokens > 0
-    ? ` · 写入 ${formatTokenCount(stats.cacheWriteInputTokens)} tok`
+    ? ` | 写入token：${formatTokenCount(stats.cacheWriteInputTokens)}`
     : "";
 
-  return `${localizeAdapterLabel(adapter.label)} ${stats.hitRequests}/${stats.totalRequests} · ${formatTokenCount(stats.cachedInputTokens)}/${formatTokenCount(stats.totalInputTokens)} tok${percent}${writeText}`;
+  return (
+    `${localizeAdapterLabel(adapter.label)}` +
+    ` | 缓存命中率：${tokenHit}` +
+    ` | 缓存请求命中次数：${req} 次` +
+    ` | 缓存token/总输入：${tok}` +
+    writeText
+  );
 }
 
 function formatHitRatio(hits: number, total: number): string {
@@ -4111,21 +3768,6 @@ function buildDoctorDiagnosis(model: PiModel, options: { promptCacheRetention400
     }
   }
 
-  if (lastPromptIntegrityWarningAt > 0) {
-    const ago = Date.now() - lastPromptIntegrityWarningAt;
-    const mins = Math.floor(ago / 60000);
-    if (mins < 5) {
-      lines.push("");
-      lines.push("⚠️ 最近检测到 prompt 完整性问题：");
-      lines.push(`   最近一次检测于 ${mins > 0 ? `${mins} 分钟` : `${Math.floor(ago / 1000)} 秒`}前；该轮已跳过 prompt 重排以保留结构标记。`);
-      lines.push("   常见原因：扩展的 system prompt 格式变化，或子串碰撞。");
-      lines.push("   建议步骤：");
-      lines.push("     1. 运行 /reload 重置（可清除瞬态问题）。");
-      lines.push("     2. 设置 PI_CACHE_OPTIMIZER_NO_PROMPT_REWRITE=1 后 /reload，禁用重排。");
-      lines.push("     3. 若持续复现，请带 doctor 输出提 issue。");
-    }
-  }
-
   return lines.join("\n");
 }
 
@@ -4333,23 +3975,13 @@ function formatCompatKeysForInsertion(compatKeys: Record<string, unknown>): stri
 // (.trellis/tasks/.../verify.ts) can exercise them. They are not part of the
 // extension's public API; the host runtime only invokes the default export below.
 export const __internals_for_tests = {
-  buildStableCandidates,
-  optimizeSystemPrompt,
+  joinSystemPromptBlocks,
+  mapSystemPromptBlocks,
+  systemPromptBlocksEqual,
   stripSessionOverviewChurn,
-  extractStructuralMarkers,
-  formatSkillsForPrompt,
-  formatSkillsForPromptCompressed,
-  compressSkillsInSystemPrompt,
-  MIN_STABLE_CANDIDATE_LENGTH,
-  SKILL_COMPRESSION_MIN_COUNT,
   NO_PROMPT_REWRITE_ENV,
   isEnabledEnv,
-  // OpenAI-family cache-key helpers
-  addOpenAIPromptCacheKey,
-  clampPromptCacheKey,
-  hasEffectivePromptCacheKey,
   isNonEmptyString,
-  shouldInjectOpenAIPromptCacheKey,
   isOpenAICompatibleApi,
   isOpenAICompatibleProxyApi,
   isResponsesPromptRewriteBypassApi,
@@ -4498,10 +4130,9 @@ export const __internals_for_tests = {
   isRuntimeOptimizerEnabled,
   getOptimizerRuntimeModeLines,
   formatOptimizerRuntimeMode,
+  OMP_CACHE_RETENTION_ENV,
   PI_CACHE_RETENTION_ENV,
   LONG_CACHE_RETENTION_VALUE,
-  // Integrity diagnostics
-  getLastPromptIntegrityWarningAt,
   // Diagnostic command helpers
   buildDoctorDiagnosis,
   buildCompatDiagnosis,
@@ -4584,17 +4215,13 @@ export default function (pi: ExtensionAPI) {
   let lastStatusText: string | undefined;
   let persistenceWarningShown = false;
   let persistTimer: ReturnType<typeof setTimeout> | null = null;
-  let integrityNotificationShown = false;
   let currentSessionId = "";
   let currentSessionHash = "";
   let currentSessionHashSet = false;
   let lastActualRoutedModel: PersistedRoutedModelRef | undefined;
   let latestCacheHint: PiCacheHintSnapshot | undefined;
-  // OMP divergence: prompt rewriting moved from before_agent_start to
-  // before_provider_request (OMP's before_agent_start can only inject messages,
-  // not mutate systemPrompt). Store prompt options per session/model so an
-  // overlapping turn or sub-agent cannot overwrite another request's rewrite
-  // context before before_provider_request fires.
+  // OMP 17：主 prompt 重写在 before_agent_start（systemPrompt: string[]）。
+  // promptRewriteContexts 仅保留路由快照供 routing/hints，不再缓存 options。
   const promptRewriteContexts = new Map<string, PromptRewriteContext>();
   const PERSIST_DEBOUNCE_MS = 2000;
   /** In-memory recent usage samples per model key (not persisted, cleared on reload). */
@@ -4613,7 +4240,7 @@ export default function (pi: ExtensionAPI) {
   const uninstallCacheHintsService = installCacheHintsService({
     version: 1,
     getHints(input: PiCacheHintsInput): PiCacheHintsOutput | undefined {
-      if (!runtimeOptimizerEnabled || isEnabledEnv(process.env[NO_PROMPT_REWRITE_ENV])) return undefined;
+      if (!runtimeOptimizerEnabled || isPromptRewriteDisabled()) return undefined;
       const hint = latestCacheHint;
       if (!hint) return undefined;
       if (input.sessionIdHash && hint.sessionIdHash && input.sessionIdHash !== hint.sessionIdHash) return undefined;
@@ -4809,8 +4436,6 @@ export default function (pi: ExtensionAPI) {
       // OMP extension reload creates a fresh closure, so cacheStatsByModel
       // starts empty. Read persisted data and filter for current session.
       lastStatusText = undefined;
-      lastPromptIntegrityWarningAt = 0;
-      integrityNotificationShown = false;
       clearRecentSamples();
 
       const persisted = await readPersistedCacheStats();
@@ -4933,30 +4558,6 @@ export default function (pi: ExtensionAPI) {
       statusText = runtimeOptimizerEnabled ? statsText : `缓存优化已关闭 · ${statsText}`;
     }
 
-    // If optimizeSystemPrompt detected structural truncation on this or
-    // a recent turn, flag it once in the footer so the user knows to
-    // /reload before continuing. The flag resets after emission so a
-    // single-turn glitch does not permanently taint the footer.
-    if (promptTruncationDetected && statusText !== undefined) {
-      statusText = statusText + " ⚠️ 完整性";
-      promptTruncationDetected = false;
-      lastPromptIntegrityWarningAt = Date.now();
-
-      // One-time notification with recovery steps (per session).
-      if (!integrityNotificationShown) {
-        integrityNotificationShown = true;
-        ctx.ui.notify(
-          `⚠️ ${LOG_PREFIX}：本轮重排导致一个 prompt 结构标记丢失。` +
-          `为保证完整性，已回退到原始 prompt。\n\n` +
-          `恢复步骤：\n` +
-          `1. 运行 /reload 重置（可清除瞬态问题）。\n` +
-          `2. 设置 PI_CACHE_OPTIMIZER_NO_PROMPT_REWRITE=1 后 /reload，禁用重排。\n` +
-          `3. 若持续复现，请运行 /cache-optimizer doctor 并提 issue（不要包含 API key / prompt）。`,
-          "warning",
-        );
-      }
-    }
-
     // ⚠️ compat footer marker: if the active model has adapter-specific
     // missing compat (DeepSeek reasoning/cache compat, or a non-official
     // openai-completions model missing cache/session-affinity flags), append
@@ -5009,37 +4610,68 @@ export default function (pi: ExtensionAPI) {
       ? findModelInRegistry(_ctx.modelRegistry, routeSnapshot.provider, routeSnapshot.modelId) ?? routeSnapshotToPiModel(routeSnapshot, _ctx.model)
       : undefined;
 
-    const eventRecord = asRecord(event);
-    const options = (eventRecord?.systemPromptOptions as BuildSystemPromptOptions | undefined) ?? undefined;
     const model = routedModel ?? _ctx.model;
     const contextKey = makePromptRewriteContextKey(sessionHashFromContext(_ctx), model);
     rememberPromptRewriteContext(promptRewriteContexts, contextKey, {
-      options,
       routeSnapshot,
       routedModel: model,
       timestamp: Date.now(),
     });
 
-    const modelForHint = model;
     const promptCacheKey = getSessionPromptCacheKey(_ctx);
-    const cacheRetention = process.env[PI_CACHE_RETENTION_ENV] === LONG_CACHE_RETENTION_VALUE ? LONG_CACHE_RETENTION_VALUE : undefined;
-    const rawSystemPrompt = typeof eventRecord?.systemPrompt === "string" ? eventRecord.systemPrompt : "";
-    latestCacheHint = {
-      sessionIdHash: currentSessionHashSet ? currentSessionHash : sessionHashFromContext(_ctx),
-      virtualProvider: routeSnapshot?.virtualProvider ?? _ctx.model?.provider,
-      virtualModelId: routeSnapshot?.virtualModelId ?? _ctx.model?.id,
-      upstreamProvider: routeSnapshot?.provider ?? modelForHint?.provider,
-      upstreamModelId: routeSnapshot?.modelId ?? modelForHint?.id,
-      api: modelForHint?.api,
-      systemPrompt: rawSystemPrompt,
-      promptCacheKey,
-      cacheRetention,
-      timestamp: Date.now(),
-    };
-    const globals = getProtocolGlobal();
-    globals.__ompCacheOptimizerCacheKey__ = promptCacheKey;
+    const cacheRetention = readCacheRetentionValue(process.env) === LONG_CACHE_RETENTION_VALUE ? LONG_CACHE_RETENTION_VALUE : undefined;
 
-    // No systemPrompt mutation — OMP before_agent_start returns {} for no-op.
+    const publishHintFromBlocks = (blocks: string[]): void => {
+      latestCacheHint = {
+        sessionIdHash: currentSessionHashSet ? currentSessionHash : sessionHashFromContext(_ctx),
+        virtualProvider: routeSnapshot?.virtualProvider ?? _ctx.model?.provider,
+        virtualModelId: routeSnapshot?.virtualModelId ?? _ctx.model?.id,
+        upstreamProvider: routeSnapshot?.provider ?? model?.provider,
+        upstreamModelId: routeSnapshot?.modelId ?? model?.id,
+        api: model?.api,
+        systemPrompt: joinSystemPromptBlocks(blocks),
+        promptCacheKey,
+        cacheRetention,
+        timestamp: Date.now(),
+      };
+      const globals = getProtocolGlobal();
+      globals.__ompCacheOptimizerCacheKey__ = promptCacheKey;
+    };
+
+    // 规范化 event.systemPrompt：OMP 17 为 string[]；兼容旧宿主的 string。
+    const eventRecord = asRecord(event);
+    const rawSp = eventRecord?.systemPrompt;
+    const originalBlocks: string[] = Array.isArray(rawSp)
+      ? rawSp.filter((b): b is string => typeof b === "string")
+      : typeof rawSp === "string"
+        ? [rawSp]
+        : [];
+
+    // Responses 族 API：服务端管理缓存 + 更严的内容安全过滤。
+    // 跳过全部 prompt 变更；仍发布未修改的 hint。
+    if (model && isResponsesPromptRewriteBypassApi(model.api)) {
+      if (originalBlocks.length > 0) publishHintFromBlocks(originalBlocks);
+      return {};
+    }
+    if (!runtimeOptimizerEnabled) {
+      if (originalBlocks.length > 0) publishHintFromBlocks(originalBlocks);
+      return {};
+    }
+    if (isPromptRewriteDisabled()) {
+      if (originalBlocks.length > 0) publishHintFromBlocks(originalBlocks);
+      return {};
+    }
+    if (originalBlocks.length === 0) return {};
+
+    // 块级改写：仅逐块清理 <session-overview> churn。不压缩 skills、不重排块顺序，
+    // 保持 OMP 17 systemPrompt: string[] 的块内容与顺序逐字保真。
+    const finalBlocks = mapSystemPromptBlocks(originalBlocks, stripSessionOverviewChurn);
+
+    publishHintFromBlocks(finalBlocks);
+
+    if (!systemPromptBlocksEqual(finalBlocks, originalBlocks)) {
+      return { systemPrompt: finalBlocks };
+    }
     return {};
   });
 
@@ -5048,62 +4680,28 @@ export default function (pi: ExtensionAPI) {
     let mutated = false;
     let resultPayload = event.payload;
 
-    // ── Prompt rewrite (migrated from before_agent_start) ──
-    // OMP divergence: prompt rewriting happens here in the provider payload, not
-    // in before_agent_start. We apply the 3-step pipeline (churn strip → skill
-    // compression → stable-prefix reorder) to the system prompt inside the payload.
+    // 仅安全网：若 before_agent_start 未剥离 session-overview churn
+    //（钩子未跑 / 被后续覆盖），此处只 strip RECENT COMMITS，不做 skills/reorder。
     if (
       runtimeOptimizerEnabled &&
-      !isEnabledEnv(process.env[NO_PROMPT_REWRITE_ENV]) &&
+      !isPromptRewriteDisabled() &&
       requestModel &&
       !isResponsesPromptRewriteBypassApi(requestModel.api)
     ) {
-      const contextKey = makePromptRewriteContextKey(sessionHashFromContext(ctx), requestModel);
-      const rewriteContext = getPromptRewriteContext(promptRewriteContexts, contextKey);
-      const promptOptions = rewriteContext?.options;
       const original = extractSystemPrompt(resultPayload);
-      if (original && original.trim().length > 0) {
-        // Step 1: strip per-turn churn from <session-overview>.
+      if (
+        original &&
+        original.includes("<session-overview>") &&
+        original.includes("RECENT COMMITS")
+      ) {
         const stripped = stripSessionOverviewChurn(original);
-
-        // Step 2: compress skills XML → one-line index (requires cached options).
-        const compressed = promptOptions
-          ? compressSkillsInSystemPrompt(stripped, promptOptions)
-          : stripped;
-
-        // Step 3: lift stable content above dynamic content (requires cached options).
-        let finalPrompt = compressed;
-        let changed = false;
-        if (promptOptions) {
-          const optimized = optimizeSystemPrompt(compressed, promptOptions);
-          if (optimized.changed && optimized.systemPrompt.trim().length > 0) {
-            finalPrompt = optimized.systemPrompt;
-            changed = true;
-          }
-        }
-
-        // Write back if any step changed the prompt.
-        if (changed || finalPrompt !== original) {
-          if (setSystemPrompt(resultPayload, finalPrompt)) {
-            mutated = true;
-            // Update the cache hint with the optimized prompt so router/hints
-            // integrators see the final shipped system prompt.
-            if (latestCacheHint) {
-              latestCacheHint.systemPrompt = finalPrompt;
-            }
-          }
+        if (stripped !== original && setSystemPrompt(resultPayload, stripped)) {
+          mutated = true;
+          if (latestCacheHint) latestCacheHint.systemPrompt = stripped;
         }
       }
     }
 
-    // ── prompt_cache_key injection (OpenAI-compatible) ──
-    if (shouldInjectOpenAIPromptCacheKey() && isOpenAICompatibleProxyApi(requestModel?.api)) {
-      const withKey = addOpenAIPromptCacheKey(resultPayload, getSessionPromptCacheKey(ctx));
-      if (withKey !== undefined) {
-        resultPayload = withKey;
-        mutated = true;
-      }
-    }
     // ── Safety: strip prompt_cache_retention for 400-history models ──
     // OMP divergence: Pi defaults supportsLongCacheRetention to true for all
     // openai-completions models and runs a 4-gate safety check. OMP's pi-ai

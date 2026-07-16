@@ -6,7 +6,7 @@
 
 > 本项目是基于 [pi-cache-optimizer](https://github.com/jiangge/pi-cache-optimizer) 的二次开发（fork），适配 OMP（Oh My Pi）运行时。原项目由 [freescheme](https://github.com/jiangge) 开发，在此致谢。
 
-用于提升 OMP 中 provider 侧 KV Cache / Prompt Cache 命中率的扩展：把稳定 prompt 内容前置，给 OpenAI-compatible 请求补保守的 `prompt_cache_key`，提示代理渠道常见缓存路由兼容问题，并在底部显示只读缓存统计。
+用于提升 OMP 中 provider 侧 KV Cache / Prompt Cache 命中率的扩展：清理 session-overview 中的易变字段以稳定 prompt 前缀，提示代理渠道常见缓存路由兼容问题，并在底部显示只读缓存统计。
 
 > 本包从 `pi-cache-optimizer` fork 而来。已有底部统计会自动从旧状态目录 `~/.pi/agent/` 迁移到 `~/.omp/agent/`。正常运行时扩展不会触碰你的 `~/.omp/agent/models.yml`；`/cache-optimizer fix` 当前显示可复制的 YAML compat 片段供手动编辑（自动写入的外科 YAML 编辑器计划在后续版本实现）。
 
@@ -18,7 +18,8 @@
 - **模型配置**：`models.json` (JSONC) → `models.yml` (YAML)
 - **包作用域**：`@earendil-works/pi-coding-agent` → `@oh-my-pi/pi-coding-agent`
 - **扩展清单**：`package.json` 的 `pi.extensions` → `omp.extensions`（`pi.extensions` 仍兼容）
-- **prompt 重写位置**：从 `before_agent_start`（直接改 systemPrompt）迁移到 `before_provider_request`（在 provider payload 层面修改），因为 OMP 的 `before_agent_start` 只支持注入消息，不支持修改 system prompt
+- **prompt 重写位置**：早期 fork 因 OMP 仅支持 message 注入而迁到 `before_provider_request`。**OMP 17+：主重写回到 `before_agent_start`（`systemPrompt: string[]` 块数组）**，仅做 `<session-overview>` churn strip，保持块顺序与内容逐字保真；`before_provider_request` 仅负责 session-overview 兜底 strip 与 `prompt_cache_retention` 安全网
+- **skills 列表与 cache key**：OMP 17 的 `<skills>` 块逐字保留（含描述），本扩展不再压缩或重排 skill 描述；provider-facing `prompt_cache_key` 由 OMP 17 宿主解析（`providerPromptCacheKey ?? providerSessionId ?? sessionId`），扩展只读取 header key 供 cache hint，不向 provider payload 注入
 - **compat 字段重映射**：
   - `forceAdaptiveThinking` → 移除（OMP 内置 catalog 自动设置）
   - `sendSessionAffinityHeaders` / `sendSessionIdHeader` → 移除（OMP 用多凭据 auth + `agent.db` 实现会话亲和性）
@@ -46,10 +47,8 @@
 
 ## 功能
 
-- 将稳定的 system prompt 内容移动到动态上下文之前（在 `before_provider_request` 中对 provider payload 应用）。
-- 压缩 OMP skill 列表，并移除 session-overview 中的易变字段。
-- 通过 `PI_CACHE_RETENTION=long` 请求长缓存保留（OMP 沿用同一环境变量）。
-- 对 `openai-completions` / `openai-responses` 请求，在没有有效 key 时使用 OMP session id 补 `prompt_cache_key`。
+- 在 `before_agent_start` 对 `systemPrompt: string[]` 逐块清理 `<session-overview>` 中的易变字段（RECENT COMMITS、Working directory、Line count），保持块顺序与 skill 描述逐字不变。
+- 通过 `OMP_CACHE_RETENTION=long` 请求长缓存保留（同时镜像 `PI_CACHE_RETENTION` 供宿主读取）。
 - 对缺少长缓存保留 compat 的第三方 OpenAI-compatible 代理给出一次性提醒。
 - 检测 Anthropic adaptive thinking 模型（opus-4.6+、sonnet-4.6+、fable-5+）—— OMP 内置 catalog 已自动处理，此处仅作信息性提示。
 - 为支持的模型家族显示按 session 隔离的底部缓存统计。
@@ -92,11 +91,9 @@ OMP 0.79.7 及之后，`omp update` 默认只更新 OMP 本体。若要更新已
 
 | 环境变量 | 作用 |
 |---|---|
-| `PI_CACHE_OPTIMIZER_NO_PROMPT_REWRITE=1` | 只关闭 prompt 改写；footer 统计和 cache-key fallback 仍启用。 |
-| `PI_CACHE_OPTIMIZER_NO_SKILL_COMPRESSION=1` | 保留 OMP 原始 verbose skill XML。 |
-| `PI_CACHE_OPTIMIZER_NO_OPENAI_CACHE_KEY=1` | 关闭 OpenAI-compatible `prompt_cache_key` fallback。推荐使用这个显式 opt-out。 |
+| `OMP_CACHE_OPTIMIZER_NO_PROMPT_REWRITE=1` | 关闭 prompt 改写（session-overview churn strip）；footer 统计与 cache hint 仍启用。 |
 
-> OMP 会自动将 `OMP_CACHE_OPTIMIZER_*` 镜像为 `PI_CACHE_OPTIMIZER_*`，因此两个前缀都可使用。
+> 主前缀为 `OMP_`。读取时仍兼容旧 `PI_CACHE_OPTIMIZER_*` / `PI_CACHE_RETENTION`；宿主 `pi-ai` 仍读 `PI_CACHE_RETENTION`，扩展写入 long 时会同步镜像。
 
 ## OpenAI-compatible 代理配置
 
@@ -186,22 +183,22 @@ OMP 0.79+ 已内置 footer `CH` 标记，用于显示最近一次 prompt cache h
 示例 footer：
 
 ```text
-OpenAI Cache 3/10 · 0.002M/0.005M tok (40%) ⚠️ 配置
+OpenAI Cache | 缓存命中率：40% | 缓存请求命中次数：3/10 次 | 缓存token/总输入：3.00k/7.50k ⚠️ 配置
 ```
-格式：`<适配器标签> <命中请求数>/<总请求数> · <缓存 tokens>/<总输入 tokens> tok (<token 命中率>)`。部分 adapter 还可能追加 `· 写入 <tokens> tok`，运行时诊断可能追加 `⚠️ 配置` 或 `⚠️ 完整性`。
+
+格式：`<适配器标签> | 缓存命中率：… | 缓存请求命中次数：… 次 | 缓存token/总输入：…`。部分 adapter 还可能追加 `| 写入token：…`，运行时诊断可能追加 `⚠️ 配置`。
 
 各部分说明：
 
 | 部分 | 示例 | 说明 |
 |---|---|---|
-| 适配器标签 | `OpenAI Cache` | 识别到的模型家族，匹配对应的缓存适配器。未命中时显示 `0/0` |
-| 命中/总请求 | `3/10` | 当前 session + 模型下的缓存命中次数与总请求数 |
-| 缓存/总 tokens | `0.002M/0.005M tok` | prompt cache 命中的 input tokens 与总 input tokens（M = million = 百万） |
-| token 命中率 | `(40%)` | 缓存 tokens 占总输入 tokens 的百分比 |
-| 写入 | `· 写入 0.001M tok` | 当前 session 累计新写入 prompt cache 的 tokens。仅 DeepSeek、OpenAI、Gemini 等适配器显示 |
-| `⚠️ 配置` | 显示在末尾 | 当前模型缺少可安全修复的 compat 配置（如 reasoning 相关字段），建议运行 `/cache-optimizer fix` |
-| `⚠️ 完整性` | 显示在末尾 | prompt 重排时检测到结构标记丢失，已回退到原始 prompt。一次性告警，`/reload` 后清除 |
-| `缓存优化已关闭 ·` | 前缀 | `/cache-optimizer disable` 后出现，表示统计以对比模式采集，不再改写 prompt |
+| 适配器标签 | `OpenAI Cache` | 识别到的模型家族，匹配对应的缓存适配器 |
+| **缓存命中率** | `40%` | **主指标（按 token）**：缓存 input tokens ÷ 总 input tokens（本 session + 模型累计） |
+| 缓存请求命中次数 | `3/10 次` | `cacheRead > 0` 的请求数 / 总请求数 |
+| 缓存token/总输入 | `3.00k/7.50k` | prompt cache 命中的 input tokens 与总 input tokens（k/M 缩写） |
+| 写入token | `写入token：1.20k` | 累计新写入 prompt cache 的 tokens（部分 adapter） |
+| `⚠️ 配置` | 显示在末尾 | 当前模型缺少可安全修复的 compat 配置，建议 `/cache-optimizer fix` |
+| `缓存优化已关闭 ·` | 前缀 | `/cache-optimizer disable` 后出现，对比模式只统计不改写 |
 
 支持的 footer label 包括：DS、Claude、OpenAI、Gemini、Kimi、Qwen、GLM、MiniMax、Mimo、Hunyuan、Mistral、Grok、Llama、Nemotron、Cohere、Yi、Doubao、ERNIE、Baichuan、StepFun、Spark、InternLM、Gemma、Phi、Jamba、Solar、Sonar、Nova、Reka、Falcon、DBRX、MPT、StableLM、Aquila、EXAONE、HyperCLOVA、Luminous、Hermes、Granite、Arctic、Pangu、SenseNova、Zhinao、MiniCPM、XVERSE、Orion、OpenChat、Vicuna、Wizard、Zephyr、Dolphin、OpenOrca、Starling、BLOOM、RWKV、Aya。
 
@@ -233,7 +230,7 @@ Adapter 选择只看模型 id/name（以及 message_end 时 assistant message �
 
 ### 可选：用于预响应 UX 的实时路由注册表
 
-最终 message metadata 足以支持响应后的统计。若要支持响应前流程——首次响应前的 footer 显示、`/cache-optimizer doctor`、`/cache-optimizer compat`、`/cache-optimizer reset` 和 OpenAI-compatible `prompt_cache_key` fallback——请在 `Symbol.for("omp.routing.registry.v1")` 下注册 live route adapter。
+最终 message metadata 足以支持响应后的统计。若要支持响应前流程——首次响应前的 footer 显示、`/cache-optimizer doctor`、`/cache-optimizer compat`、`/cache-optimizer reset` 和 cache hint（报告 OMP 17 header 的 `providerPromptCacheKey` 或 session fallback）——请在 `Symbol.for("omp.routing.registry.v1")` 下注册 live route adapter。
 
 协议形状：
 
@@ -300,7 +297,7 @@ omp plugin uninstall omp-cache-optimizer
 
 1. 安装后运行 `/cache-optimizer doctor`，确认当前模型 / provider / API / compat 状态
 2. 正常使用 OMP 几轮对话后，运行 `/cache-optimizer stats` 查看 session-scoped 命中率
-3. 底部 footer 会显示实时 cache 统计（如 `OpenAI cache 3/10 · 0.002M/0.005M tok (40%)`）
+3. 底部 footer 会显示实时 cache 统计（如 `OpenAI Cache | 缓存命中率：40% | 缓存请求命中次数：3/10 次 | 缓存token/总输入：3.00k/7.50k`）
 4. 如命中率低，`/cache-optimizer doctor` 会给出低命中诊断和 compat 建议
 
 ## 致谢
