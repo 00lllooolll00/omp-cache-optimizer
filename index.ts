@@ -102,10 +102,8 @@ const STATE_FILE_PATH = join(STATE_DIR, "omp-cache-optimizer-stats.json");
 const LEGACY_PI_STATE_FILE_PATH = join(homedir(), ".pi", "agent", "pi-cache-optimizer-stats.json");
 const LEGACY_STATE_FILE_PATH = join(STATE_DIR, "deepseek-cache-optimizer-stats.json");
 const CACHE_PROVIDER_IDS: CacheProviderId[] = ["deepseek", "openai", "claude", "gemini"];
-// 扩展自身开关统一使用 OMP_CACHE_OPTIMIZER_* 前缀。
-// 读取时仍兼容旧 PI_CACHE_OPTIMIZER_*（OMP 加载 .env 时也会把 OMP_* 镜像为 PI_*）。
-const NO_PROMPT_REWRITE_ENV = "OMP_CACHE_OPTIMIZER_NO_PROMPT_REWRITE";
-const NO_PROMPT_REWRITE_ENV_LEGACY = "PI_CACHE_OPTIMIZER_NO_PROMPT_REWRITE";
+// Prompt 改写默认关闭；仅在用户明确 opt-in 时启用。
+const PROMPT_REWRITE_ENV = "OMP_CACHE_OPTIMIZER_PROMPT_REWRITE";
 // 扩展间协议符号使用 omp.* 命名空间版本化。v1 形状与旧符号一致；
 // OMP 上的 router/hints 集成方应注册 omp.routing.registry.v1 / omp.cache.hints.v1。
 const PI_ROUTING_REGISTRY_SYMBOL = Symbol.for("omp.routing.registry.v1");
@@ -284,6 +282,20 @@ type CacheUsageSample = {
   cacheWriteInputTokens: number;
   totalInputTokens: number;
   missingUsageFields: boolean;
+  promptRewriteEnabled: boolean;
+  systemPromptFingerprint?: string;
+  promptCacheKeySource: PromptCacheKeySource;
+  hintPayloadComparison: PromptComparison;
+};
+
+type PromptCacheKeySource = "header" | "session" | "unavailable";
+type PromptComparison = "match" | "mismatch" | "unavailable";
+
+type PromptRequestDiagnostics = {
+  promptRewriteEnabled: boolean;
+  systemPromptFingerprint?: string;
+  promptCacheKeySource: PromptCacheKeySource;
+  hintPayloadComparison: PromptComparison;
 };
 
 type PromptRewriteContext = {
@@ -380,14 +392,29 @@ function systemPromptBlocksEqual(a: string[], b: string[]): boolean {
   return true;
 }
 
+// OpenAI prompt_cache_key 的最大长度（API 限制）。超长会被 OpenAI 拒为 400；
+// fallback 到原始 sessionId（可能为长 UUID/复合 id）时必须截断。
+const OPENAI_PROMPT_CACHE_KEY_MAX_LENGTH = 64;
+
+/** Trim 并截断到 OpenAI prompt_cache_key 上限；空/空白返回 undefined。 */
+function clampPromptCacheKey(key: string | undefined): string | undefined {
+  const normalized = key?.trim();
+  if (!normalized) return undefined;
+  const chars = Array.from(normalized);
+  if (chars.length <= OPENAI_PROMPT_CACHE_KEY_MAX_LENGTH) return normalized;
+  return chars.slice(0, OPENAI_PROMPT_CACHE_KEY_MAX_LENGTH).join("");
+}
+
 function getSessionPromptCacheKey(ctx: ExtensionContext): string | undefined {
-  // OMP 17：provider-facing cache key 由宿主解析（providerPromptCacheKey ?? providerSessionId ?? sessionId）。
-  // 插件只读取最终 header key 供扩展间 cache hint 协议，不再向 provider payload 注入 body key。
+  // OMP 17：宿主解析 provider-facing cache key（header.providerPromptCacheKey ?? sessionId）。
+  // 插件读取该 key 有两个用途：(1) 扩展间 cache hint 协议；(2) before_provider_request
+  // 中为 OpenAI-compatible API（host 不注入的 openai-completions chat wire）兜底写入 body
+  // prompt_cache_key。两路都经 clampPromptCacheKey 截断到 64 字符以避免 OpenAI 400。
   const header = ctx.sessionManager.getHeader?.();
   const providerPromptCacheKey = asRecord(header)?.providerPromptCacheKey;
-  if (isNonEmptyString(providerPromptCacheKey)) return (providerPromptCacheKey as string).trim();
+  if (isNonEmptyString(providerPromptCacheKey)) return clampPromptCacheKey(providerPromptCacheKey as string);
   const sessionId = ctx.sessionManager.getSessionId();
-  return isNonEmptyString(sessionId) ? sessionId.trim() : undefined;
+  return clampPromptCacheKey(sessionId);
 }
 
 /**
@@ -397,6 +424,26 @@ function getSessionPromptCacheKey(ctx: ExtensionContext): string | undefined {
  */
 function hashSessionId(sessionId: string): string {
   return createHash("sha256").update(sessionId).digest("hex").slice(0, 16);
+}
+
+/** Returns a non-reversible diagnostic fingerprint; never persist the prompt text. */
+function fingerprintPrompt(prompt: string | undefined): string | undefined {
+  return typeof prompt === "string"
+    ? createHash("sha256").update(prompt).digest("hex").slice(0, 16)
+    : undefined;
+}
+
+function comparePromptFingerprints(
+  expected: string | undefined,
+  actual: string | undefined,
+): PromptComparison {
+  if (!expected || !actual) return "unavailable";
+  return expected === actual ? "match" : "mismatch";
+}
+
+function getPromptCacheKeySource(header: unknown, sessionId: string | undefined): PromptCacheKeySource {
+  if (isNonEmptyString(asRecord(header)?.providerPromptCacheKey)) return "header";
+  return sessionId ? "session" : "unavailable";
 }
 
 function getProtocolGlobal(): ProtocolGlobal {
@@ -701,15 +748,8 @@ function isEnabledEnv(value: string | undefined): boolean {
   return normalized === "1" || normalized === "true" || normalized === "yes" || normalized === "on";
 }
 
-/** 读取开关：优先 OMP_ 主名，其次兼容旧 PI_ 名。 */
-function isEnvFlagEnabled(primary: string, legacy: string, env: MutableEnv = process.env): boolean {
-  if (isEnabledEnv(env[primary])) return true;
-  if (isEnabledEnv(env[legacy])) return true;
-  return false;
-}
-
-function isPromptRewriteDisabled(env: MutableEnv = process.env): boolean {
-  return isEnvFlagEnabled(NO_PROMPT_REWRITE_ENV, NO_PROMPT_REWRITE_ENV_LEGACY, env);
+function isPromptRewriteEnabled(env: MutableEnv = process.env): boolean {
+  return isEnabledEnv(env[PROMPT_REWRITE_ENV]);
 }
 
 function setRuntimeOptimizerEnabled(enabled: boolean, env: MutableEnv = process.env): void {
@@ -730,14 +770,14 @@ function getOptimizerRuntimeModeLines(): string[] {
   const lines: string[] = [];
   const retention = readCacheRetentionValue(process.env);
   lines.push(`运行状态：${state}`);
-  lines.push(`• Prompt 重写：${runtimeOptimizerEnabled && !isPromptRewriteDisabled() ? "开启" : "关闭"}`);
+  lines.push(`• Prompt 重写：${runtimeOptimizerEnabled && isPromptRewriteEnabled() ? "开启" : "关闭"}`);
   lines.push(`• Footer 缓存统计：开启${runtimeOptimizerEnabled ? "" : "（对比模式）"}`);
   lines.push(`• Compat 提示：${runtimeOptimizerEnabled ? "开启" : "关闭"}`);
   lines.push(`• ${OMP_CACHE_RETENTION_ENV}：${retention ?? "（未设置）"}`);
   if (!runtimeOptimizerEnabled) {
     lines.push("这是当前进程内开关。运行 /reload 或重启 OMP 可恢复到启动时行为。");
-  } else if (isPromptRewriteDisabled()) {
-    lines.push("仍有部分能力被环境变量关闭。");
+  } else if (!isPromptRewriteEnabled()) {
+    lines.push(`可设置 ${PROMPT_REWRITE_ENV}=1 显式开启 prompt 重写。`);
   }
   return lines;
 }
@@ -3077,6 +3117,21 @@ function hasMissingUsageFields(message: unknown, adapter: CacheProviderAdapter):
   return false;
 }
 
+function formatRecentPromptDiagnostics(samples: CacheUsageSample[], maxCount: number): string | undefined {
+  const recent = samples.slice(-maxCount);
+  if (recent.length === 0) return undefined;
+  const rewriteEnabled = recent.filter((sample) => sample.promptRewriteEnabled).length;
+  const fingerprints = new Set(recent.flatMap((sample) => sample.systemPromptFingerprint ? [sample.systemPromptFingerprint] : []));
+  const headerKeys = recent.filter((sample) => sample.promptCacheKeySource === "header").length;
+  const sessionKeys = recent.filter((sample) => sample.promptCacheKeySource === "session").length;
+  const mismatches = recent.filter((sample) => sample.hintPayloadComparison === "mismatch").length;
+  const unavailable = recent.filter((sample) => sample.hintPayloadComparison === "unavailable").length;
+  let result = `Prompt 诊断（最近 ${recent.length} 次）：改写开启 ${rewriteEnabled}/${recent.length} · system 指纹 ${fingerprints.size} 组 · cache key 来源 header ${headerKeys} / session ${sessionKeys}`;
+  if (mismatches > 0) result += ` · hint/payload 不一致 ${mismatches}`;
+  if (unavailable > 0) result += ` · 不可比较 ${unavailable}`;
+  return result;
+}
+
 function formatRecentTrendSummary(samples: CacheUsageSample[], maxCount: number): string {
   const recent = samples.slice(-maxCount);
   if (recent.length === 0) return `最近 ${maxCount} 次：暂无样本`;
@@ -3114,6 +3169,13 @@ function buildStatsOutput(model: PiModel | undefined, adapter: CacheProviderAdap
   lines.push(`缓存 tokens：${formatTokenM(currentStats.cachedInputTokens)}M / ${formatTokenM(currentStats.totalInputTokens)}M 输入 · ${currentStats.totalInputTokens > 0 ? `${Math.round((currentStats.cachedInputTokens / currentStats.totalInputTokens) * 100)}%` : "无数据"}`);
   if (currentStats.cacheWriteInputTokens > 0) {
     lines.push(`缓存写入：${formatTokenM(currentStats.cacheWriteInputTokens)}M tok`);
+  }
+
+  const promptDiagnostics = formatRecentPromptDiagnostics(recentSamples, 10);
+  if (promptDiagnostics) {
+    lines.push("");
+    lines.push(promptDiagnostics);
+    lines.push("仅显示截断哈希和来源统计，不保存 prompt 或 cache key 原文。");
   }
 
   lines.push("");
@@ -3789,9 +3851,12 @@ function buildLowHitDiagnosis(
   const recent10Cached = recent10.reduce((sum, s) => sum + s.cachedInputTokens, 0);
   const recent10Input = recent10.reduce((sum, s) => sum + s.totalInputTokens, 0);
   const todayStats = stats ?? emptyCacheStats();
+  const promptMismatchSamples = recent10.filter((sample) => sample.hintPayloadComparison === "mismatch").length;
+  const promptFingerprints = new Set(recent10.flatMap((sample) => sample.systemPromptFingerprint ? [sample.systemPromptFingerprint] : []));
 
   const hasMissingCompat = safeFixableMissingLHD.length > 0;
   const hasRouterRisk = routerNotes.length > 0;
+
   const hasUsageMissing = missingUsageSamples > 0;
   const todayHitRatio = todayStats.totalInputTokens > 0
     ? Math.round((todayStats.cachedInputTokens / todayStats.totalInputTokens) * 100)
@@ -3808,6 +3873,14 @@ function buildLowHitDiagnosis(
 
   lines.push("");
   lines.push("── 缓存诊断 ──");
+  if (promptMismatchSamples > 0) {
+    lines.push(`⚠️ 最近 ${recent10Total} 条请求中有 ${promptMismatchSamples} 条的发送 system prompt 与 cache hint 不一致。`);
+    lines.push("   这通常表示后续 extension 或宿主在 hint 发布后修改了 prompt，可能导致 provider cache 前缀失效。");
+  }
+  if (promptFingerprints.size > 1) {
+    lines.push(`ℹ️ 最近 ${recent10Total} 条请求观测到 ${promptFingerprints.size} 组 system prompt 指纹。`);
+    lines.push("   若低命中持续，请避免在同一实验窗口混用不同 prompt 模式或动态 system 内容。");
+  }
 
   if (hasMissingCompat) {
     lines.push(`⚠️ 缺少 compat 字段：${safeFixableMissingLHD.join(", ")}`);
@@ -3979,8 +4052,11 @@ export const __internals_for_tests = {
   mapSystemPromptBlocks,
   systemPromptBlocksEqual,
   stripSessionOverviewChurn,
-  NO_PROMPT_REWRITE_ENV,
+  PROMPT_REWRITE_ENV,
   isEnabledEnv,
+  fingerprintPrompt,
+  comparePromptFingerprints,
+  getPromptCacheKeySource,
   isNonEmptyString,
   isOpenAICompatibleApi,
   isOpenAICompatibleProxyApi,
@@ -4226,6 +4302,8 @@ export default function (pi: ExtensionAPI) {
   const PERSIST_DEBOUNCE_MS = 2000;
   /** In-memory recent usage samples per model key (not persisted, cleared on reload). */
   const recentSamplesByModelKey = new Map<string, CacheUsageSample[]>();
+  /** Per-request diagnostics awaiting the corresponding message_end event; never persisted. */
+  const pendingRequestDiagnosticsByModelKey = new Map<string, PromptRequestDiagnostics>();
 
   function syncSessionHash(ctx: Pick<ExtensionContext, "sessionManager">): void {
     const sid = ctx.sessionManager.getSessionId();
@@ -4240,7 +4318,7 @@ export default function (pi: ExtensionAPI) {
   const uninstallCacheHintsService = installCacheHintsService({
     version: 1,
     getHints(input: PiCacheHintsInput): PiCacheHintsOutput | undefined {
-      if (!runtimeOptimizerEnabled || isPromptRewriteDisabled()) return undefined;
+      if (!runtimeOptimizerEnabled) return undefined;
       const hint = latestCacheHint;
       if (!hint) return undefined;
       if (input.sessionIdHash && hint.sessionIdHash && input.sessionIdHash !== hint.sessionIdHash) return undefined;
@@ -4277,7 +4355,12 @@ export default function (pi: ExtensionAPI) {
     return idx >= 0 ? sKey.slice(idx + 1) : sKey;
   }
 
-  function recordRecentSample(modelKeyStr: string, usage: UsageSnapshot, missingUsageFields: boolean): void {
+  function recordRecentSample(
+    modelKeyStr: string,
+    usage: UsageSnapshot,
+    missingUsageFields: boolean,
+    diagnostics: PromptRequestDiagnostics | undefined,
+  ): void {
     let samples = recentSamplesByModelKey.get(modelKeyStr);
     if (!samples) {
       samples = [];
@@ -4290,6 +4373,10 @@ export default function (pi: ExtensionAPI) {
       cacheWriteInputTokens: usage.cacheWrite,
       totalInputTokens: usage.totalInput,
       missingUsageFields,
+      promptRewriteEnabled: diagnostics?.promptRewriteEnabled ?? isPromptRewriteEnabled(),
+      systemPromptFingerprint: diagnostics?.systemPromptFingerprint,
+      promptCacheKeySource: diagnostics?.promptCacheKeySource ?? "unavailable",
+      hintPayloadComparison: diagnostics?.hintPayloadComparison ?? "unavailable",
     });
     if (samples.length > MAX_RECENT_SAMPLES) {
       samples.splice(0, samples.length - MAX_RECENT_SAMPLES);
@@ -4302,6 +4389,7 @@ export default function (pi: ExtensionAPI) {
 
   function clearRecentSamples(): void {
     recentSamplesByModelKey.clear();
+    pendingRequestDiagnosticsByModelKey.clear();
   }
 
   function getCacheStatsState(): CacheStatsState {
@@ -4657,7 +4745,7 @@ export default function (pi: ExtensionAPI) {
       if (originalBlocks.length > 0) publishHintFromBlocks(originalBlocks);
       return {};
     }
-    if (isPromptRewriteDisabled()) {
+    if (!isPromptRewriteEnabled()) {
       if (originalBlocks.length > 0) publishHintFromBlocks(originalBlocks);
       return {};
     }
@@ -4684,7 +4772,7 @@ export default function (pi: ExtensionAPI) {
     //（钩子未跑 / 被后续覆盖），此处只 strip RECENT COMMITS，不做 skills/reorder。
     if (
       runtimeOptimizerEnabled &&
-      !isPromptRewriteDisabled() &&
+      isPromptRewriteEnabled() &&
       requestModel &&
       !isResponsesPromptRewriteBypassApi(requestModel.api)
     ) {
@@ -4699,6 +4787,46 @@ export default function (pi: ExtensionAPI) {
           mutated = true;
           if (latestCacheHint) latestCacheHint.systemPrompt = stripped;
         }
+      }
+    }
+
+    const requestDiagnosticsModel = requestModel ?? ctx.model;
+    if (requestDiagnosticsModel) {
+      const payloadPrompt = extractSystemPrompt(resultPayload);
+      const hintPrompt = latestCacheHint?.systemPrompt;
+      const header = ctx.sessionManager.getHeader?.();
+      pendingRequestDiagnosticsByModelKey.set(sessionModelKey(requestDiagnosticsModel), {
+        promptRewriteEnabled: isPromptRewriteEnabled(),
+        systemPromptFingerprint: fingerprintPrompt(payloadPrompt),
+        promptCacheKeySource: getPromptCacheKeySource(header, ctx.sessionManager.getSessionId()),
+        hintPayloadComparison: comparePromptFingerprints(
+          fingerprintPrompt(hintPrompt),
+          fingerprintPrompt(payloadPrompt),
+        ),
+      });
+    }
+
+    // ── prompt_cache_key injection (OpenAI-compatible APIs) ──
+    // OMP 17 host injects prompt_cache_key into the body for openai-responses /
+    // azure-openai-responses, but NOT for openai-completions (chat) wire. We inject
+    // a cache key for ALL OpenAI-compatible APIs, but only when the payload doesn't
+    // already carry one — so responses (host-injected) are automatically skipped,
+    // and completions (host-skipped) get the key they need for proxy routing affinity.
+    // The key is read from the host header (providerPromptCacheKey) or session id fallback,
+    // and clamped to OpenAI's 64-char prompt_cache_key limit (see clampPromptCacheKey).
+    // For Anthropic / Google / other non-OpenAI APIs, prompt_cache_key is not a valid
+    // body parameter and isOpenAICompatibleApi excludes them.
+    if (runtimeOptimizerEnabled && isOpenAICompatibleApi(requestModel?.api)) {
+      const payloadRecord = asRecord(resultPayload);
+      const cacheKey = getSessionPromptCacheKey(ctx);
+      if (
+        payloadRecord &&
+        isNonEmptyString(cacheKey) &&
+        !isNonEmptyString(payloadRecord.prompt_cache_key) &&
+        !isNonEmptyString(payloadRecord.promptCacheKey)
+      ) {
+        payloadRecord.prompt_cache_key = cacheKey;
+        mutated = true;
       }
     }
 
@@ -4791,7 +4919,11 @@ export default function (pi: ExtensionAPI) {
       const missingFields = usage === undefined || (usage.cacheRead === 0 && usage.cacheWrite === 0 && usage.totalInput === 0)
         ? true
         : hasMissingUsageFields(event.message, adapter);
-      recordRecentSample(sk, usage ?? { cacheRead: 0, cacheWrite: 0, totalInput: 0 }, missingFields);
+      const diagnostics = pendingRequestDiagnosticsByModelKey.get(sk)
+        ?? (ctx.model ? pendingRequestDiagnosticsByModelKey.get(sessionModelKey(ctx.model)) : undefined);
+      pendingRequestDiagnosticsByModelKey.delete(sk);
+      if (ctx.model) pendingRequestDiagnosticsByModelKey.delete(sessionModelKey(ctx.model));
+      recordRecentSample(sk, usage ?? { cacheRead: 0, cacheWrite: 0, totalInput: 0 }, missingFields, diagnostics);
     }
 
     if (!usage) {
