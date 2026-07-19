@@ -808,7 +808,7 @@ expect(
 );
 // 3d. 无 host header 时注入项目级稳定 key，而不是 sessionId。
 const longSessionId = "x".repeat(80);
-const fallbackModel = { provider: "proxy", id: "gpt-test", api: "openai-completions", baseUrl: "https://proxy.example/v1" };
+const fallbackModel = { provider: "proxy", id: "gpt-test", api: "openai-responses", baseUrl: "https://proxy.example/v1" };
 const fallbackCtx = makeContext({
   model: fallbackModel,
   cwd: "/tmp/project-a",
@@ -911,7 +911,7 @@ expect(
   unknownBodyPayload.prompt_cache_key === "unknown-custom-identity",
   `未知自定义 body key 应保留，实际: ${JSON.stringify(unknownBodyPayload.prompt_cache_key)}`,
 );
-// 四种 OpenAI API 在无 header 时都注入项目 key
+// Chat Completions 无 header 时按 session 隔离；Responses 族无 header 时使用项目稳定 key。
 for (const api of ["openai-completions", "openai-responses", "openai-codex-responses", "azure-openai-responses"] as const) {
   const apiModel = { provider: "proxy", id: "gpt-test", api, baseUrl: "https://proxy.example/v1" };
   const apiCtx = makeContext({
@@ -922,11 +922,34 @@ for (const api of ["openai-completions", "openai-responses", "openai-codex-respo
   const apiPayload: Record<string, unknown> = { model: "gpt-test", messages: [] };
   harness.runBeforeProviderRequest({ payload: apiPayload }, apiCtx);
   expect(
-    `before_provider_request.injects-project-key-for-${api}`,
-    apiPayload.prompt_cache_key === buildProjectPromptCacheKey("/tmp/project-a", apiModel as never),
-    `${api} 应注入项目 key，实际: ${JSON.stringify(apiPayload.prompt_cache_key)}`,
+    `before_provider_request.injects-key-for-${api}`,
+    apiPayload.prompt_cache_key ===
+      (api === "openai-completions" ? "session-for-api" : buildProjectPromptCacheKey("/tmp/project-a", apiModel as never)),
+    `${api} 应注入对应策略的 key，实际: ${JSON.stringify(apiPayload.prompt_cache_key)}`,
   );
 }
+const grokCompletionsModel = { provider: "eflowcode_grok", id: "grok-4.5", api: "openai-completions", baseUrl: "https://e-flowcode.cc/v1" };
+const grokSessionA = makeContext({
+  model: grokCompletionsModel,
+  cwd: "/tmp/project-a",
+  sessionManager: { getSessionId: () => "grok-session-a", getHeader: () => ({}) },
+});
+const grokSessionB = makeContext({
+  model: grokCompletionsModel,
+  cwd: "/tmp/project-a",
+  sessionManager: { getSessionId: () => "grok-session-b", getHeader: () => ({}) },
+});
+const grokPayloadA: Record<string, unknown> = { model: "grok-4.5", messages: [] };
+const grokPayloadB: Record<string, unknown> = { model: "grok-4.5", messages: [] };
+harness.runBeforeProviderRequest({ payload: grokPayloadA }, grokSessionA);
+harness.runBeforeProviderRequest({ payload: grokPayloadB }, grokSessionB);
+expect(
+  "before_provider_request.completions-uses-session-key-for-grok",
+  grokPayloadA.prompt_cache_key === "grok-session-a" &&
+    grokPayloadB.prompt_cache_key === "grok-session-b" &&
+    grokPayloadA.prompt_cache_key !== grokPayloadB.prompt_cache_key,
+  `Grok completions 的不同 session 应使用不同 key，实际: ${JSON.stringify({ a: grokPayloadA.prompt_cache_key, b: grokPayloadB.prompt_cache_key })}`,
+);
 // 3e. 超长 host header key：OpenAI body 用无碰撞哈希归一化，cache hint 保留完整 key。
 const longHeaderKey = `header-${"y".repeat(80)}`;
 const expectedLongWireKey = normalizePromptCacheKeyForWire(longHeaderKey);
@@ -1298,7 +1321,7 @@ withTempEnv(
 
 // ── 10. 动态 getCwd 项目 key ─────────────────────────────────────
 
-const dynamicCwdModel = { provider: "proxy", id: "gpt-test", api: "openai-completions", baseUrl: "https://proxy.example/v1" };
+const dynamicCwdModel = { provider: "proxy", id: "gpt-test", api: "openai-responses", baseUrl: "https://proxy.example/v1" };
 const dynamicCwdCtx = makeContext({
   model: dynamicCwdModel,
   cwd: "/project-a",

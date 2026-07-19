@@ -4938,8 +4938,9 @@ export default function (pi: ExtensionAPI) {
       timestamp: Date.now(),
     });
 
+    const isChatCompletionsApi = lower(model?.api) === "openai-completions";
     const resolvedPromptCacheKey = resolvePromptCacheKey(_ctx, model, {
-      allowProjectKey: runtimeOptimizerEnabled,
+      allowProjectKey: runtimeOptimizerEnabled && !isChatCompletionsApi,
       allowSessionFallback: true,
     });
     const promptCacheKey = resolvedPromptCacheKey?.key;
@@ -5022,12 +5023,14 @@ export default function (pi: ExtensionAPI) {
     }
 
     // ── prompt_cache_key injection (OpenAI-compatible APIs) ──
-    // 真实 header key 优先；否则项目级稳定 key。只替换等于本地 sessionId 的 body fallback。
+    // 真实 header key 优先；第三方 Chat Completions 在无 header 时按 session 隔离，
+    // Responses / OpenRouter 仍使用项目级稳定 key，避免不同动态 session 互相覆盖缓存。
     let resolvedProviderPromptCacheKey: ResolvedPromptCacheKey | undefined;
     if (runtimeOptimizerEnabled && isOpenAICompatibleApi(requestModel?.api)) {
+      const isChatCompletionsApi = lower(requestModel?.api) === "openai-completions";
       resolvedProviderPromptCacheKey = resolvePromptCacheKey(ctx, requestModel, {
-        allowProjectKey: true,
-        allowSessionFallback: false,
+        allowProjectKey: !isChatCompletionsApi,
+        allowSessionFallback: isChatCompletionsApi,
       });
       const cacheKey = normalizePromptCacheKeyForWire(resolvedProviderPromptCacheKey?.key);
       if (cacheKey) {
