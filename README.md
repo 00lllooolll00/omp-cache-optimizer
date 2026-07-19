@@ -18,8 +18,8 @@
 - **模型配置**：`models.json` (JSONC) → `models.yml` (YAML)
 - **包作用域**：`@earendil-works/pi-coding-agent` → `@oh-my-pi/pi-coding-agent`
 - **扩展清单**：`package.json` 的 `pi.extensions` → `omp.extensions`（`pi.extensions` 仍兼容）
-- **prompt 重写位置与默认值**：早期 fork 因 OMP 仅支持 message 注入而迁到 `before_provider_request`。OMP 17+ 的可选主重写位于 `before_agent_start`（`systemPrompt: string[]` 块数组）。**默认不改写 prompt；仅设置 `OMP_CACHE_OPTIMIZER_PROMPT_REWRITE=1` 时**，才清理 `<session-overview>` 中的易变字段，同时保持块顺序与内容逐字保真；`before_provider_request` 仅在该变量启用时做 session-overview 兜底 strip，并始终负责 `prompt_cache_retention` 安全网与 OpenAI-compatible API 的 body `prompt_cache_key` 兜底注入（截断 64 字符，payload 已有则不覆盖）。
-- **skills 列表与 cache key**：OMP 17 的 `<skills>` 块逐字保留（含描述），本扩展不再压缩或重排 skill 描述；`prompt_cache_key` 由 OMP 17 宿主解析（`providerPromptCacheKey ?? sessionId`），扩展既读取 header key 供 cache hint，又在 `before_provider_request` 为 host 不注入的 openai-completions chat wire 兜底写入 body `prompt_cache_key`（截断 64 字符防 400）
+- **prompt 重写位置与默认值**：早期 fork 因 OMP 仅支持 message 注入而迁到 `before_provider_request`。OMP 17+ 的可选主重写位于 `before_agent_start`（`systemPrompt: string[]` 块数组）。**默认不改写 prompt；仅设置 `OMP_CACHE_OPTIMIZER_PROMPT_REWRITE=1` 时**，才清理 `<session-overview>` 中的易变字段，同时保持块顺序与内容逐字保真；`before_provider_request` 仅在该变量启用时做 session-overview 兜底 strip，并始终负责 `prompt_cache_retention` 安全网与 OpenAI-compatible API 的稳定 `prompt_cache_key` 路由。
+- **skills 列表与 cache key**：OMP 17 的 `<skills>` 块逐字保留（含描述），本扩展不再压缩或重排 skill 描述。cache hint 优先完整 header `providerPromptCacheKey`；缺失时 optimizer 启用则用项目级稳定哈希 key，禁用时才 fallback sessionId。provider body 覆盖四种 OpenAI API：稳定 header 优先，否则注入项目 key；已有非 session 自定义 body key 不覆盖，session 级 body key 会被替换；超长 body key 经无碰撞哈希归一化（`pc_` + 48 hex，总长 51），cache hint 仍保留完整 host key。
 - **compat 字段重映射**：
   - `forceAdaptiveThinking` → 移除（OMP 内置 catalog 自动设置）
   - `sendSessionAffinityHeaders` / `sendSessionIdHeader` → 移除（OMP 用多凭据 auth + `agent.db` 实现会话亲和性）
@@ -91,7 +91,7 @@ OMP 0.79.7 及之后，`omp update` 默认只更新 OMP 本体。若要更新已
 
 | 环境变量 | 作用 |
 |---|---|
-| `OMP_CACHE_OPTIMIZER_PROMPT_REWRITE=1` | 显式开启 prompt 改写：清理 `<session-overview>` 的易变字段以尝试稳定 provider cache 前缀。未设置时保持 OMP 原始 prompt。footer 统计、cache hint、长缓存保留和 OpenAI-compatible `prompt_cache_key` 兜底不受影响。 |
+| `OMP_CACHE_OPTIMIZER_PROMPT_REWRITE=1` | 显式开启 prompt 改写：清理 `<session-overview>` 的易变字段以尝试稳定 provider cache 前缀。未设置时保持 OMP 原始 prompt。footer 统计、cache hint、长缓存保留和 OpenAI-compatible 稳定 `prompt_cache_key` 路由不受影响。 |
 
 > `OMP_CACHE_OPTIMIZER_NO_PROMPT_REWRITE` 和 `PI_CACHE_OPTIMIZER_NO_PROMPT_REWRITE` 已不再受支持，也不会影响行为。主前缀为 `OMP_`；宿主 `pi-ai` 仍读 `PI_CACHE_RETENTION`，扩展写入 long 时会同步镜像。
 
@@ -183,10 +183,10 @@ OMP 0.79+ 已内置 footer `CH` 标记，用于显示最近一次 prompt cache h
 示例 footer：
 
 ```text
-OpenAI Cache | 缓存命中率：40% | 缓存请求命中次数：3/10 次 | 缓存token/总输入：3.00k/7.50k ⚠️ 配置
+OpenAI Cache | 缓存命中率：40% | 最近2次token命中率：80% | 缓存请求命中次数：3/10 次 | 缓存token/总输入：3.00k/7.50k ⚠️ 配置
 ```
 
-格式：`<适配器标签> | 缓存命中率：… | 缓存请求命中次数：… 次 | 缓存token/总输入：…`。部分 adapter 还可能追加 `| 写入token：…`，运行时诊断可能追加 `⚠️ 配置`。
+格式：`<适配器标签> | 缓存命中率：… | 最近N次token命中率：… | 缓存请求命中次数：… 次 | 缓存token/总输入：…`。有近期有效样本时才追加最近命中率；部分 adapter 还可能追加 `| 写入token：…`，运行时诊断可能追加 `⚠️ 配置`。
 
 各部分说明：
 
@@ -194,7 +194,8 @@ OpenAI Cache | 缓存命中率：40% | 缓存请求命中次数：3/10 次 | 缓
 |---|---|---|
 | 适配器标签 | `OpenAI Cache` | 识别到的模型家族，匹配对应的缓存适配器 |
 | **缓存命中率** | `40%` | **主指标（按 token）**：缓存 input tokens ÷ 总 input tokens（本 session + 模型累计） |
-| 缓存请求命中次数 | `3/10 次` | `cacheRead > 0` 的请求数 / 总请求数 |
+| **最近N次token命中率** | `最近2次token命中率：80%` | 最近最多 10 次有效请求的按 token 加权命中率；缺失/零输入样本不计入，冷启动后不会长期压低累计主指标 |
+| 缓存请求命中次数 | `3/10 次` | `cacheRead > 0` 的请求数 / 总请求数；正常成功但代理缺失 usage 的全零响应仍计请求，`error` / `aborted` 全零响应不计 |
 | 缓存token/总输入 | `3.00k/7.50k` | prompt cache 命中的 input tokens 与总 input tokens（k/M 缩写） |
 | 写入token | `写入token：1.20k` | 累计新写入 prompt cache 的 tokens（部分 adapter） |
 | `⚠️ 配置` | 显示在末尾 | 当前模型缺少可安全修复的 compat 配置，建议 `/cache-optimizer fix` |
@@ -202,11 +203,11 @@ OpenAI Cache | 缓存命中率：40% | 缓存请求命中次数：3/10 次 | 缓
 
 ### Prompt 稳定性诊断
 
-`/cache-optimizer stats` 会显示最近 10 次请求的 prompt 诊断汇总：是否启用 prompt 改写、观测到的 system prompt 指纹组数、`prompt_cache_key` 来自 OMP header 或 session fallback 的次数，以及 cache hint 与实际发送 payload 是否不一致。
+`/cache-optimizer stats` 会显示最近 10 次请求的 prompt 诊断汇总：是否启用 prompt 改写、观测到的 system prompt 指纹组数、provider body `prompt_cache_key` 来自 header / 项目稳定 / 自定义 / 未注入的次数，以及 cache hint 与实际发送 payload 是否不一致。
 
 `/cache-optimizer doctor` 在低命中时会提示两类可归因问题：同一窗口内存在多组 system prompt 指纹，或 hint 发布后被后续 extension / 宿主改写了实际 payload。前者会拆分 provider cache 前缀，后者表示 cache hint 未对应最终请求。
 
-这些诊断仅保留在当前 OMP 进程的最近样本内存中，不写入 `omp-cache-optimizer-stats.json`。每个 system prompt 只记录 SHA-256 的 16 位截断指纹；cache key 只记录来源类别（`header`、`session` 或不可用），绝不保存 prompt、payload、header、session ID、cache key 或 API key 原文。
+这些诊断仅保留在当前 OMP 进程的最近样本内存中，不写入 `omp-cache-optimizer-stats.json`。每个 system prompt 只记录 SHA-256 的 16 位截断指纹；provider body cache key 只记录来源类别（`header` / `project` / `custom` / `unavailable`），绝不保存 prompt、payload、header、session ID、cache key 或 API key 原文。cache hint 的 session fallback 与 provider body 诊断分开处理。
 
 支持的 footer label 包括：DS、Claude、OpenAI、Gemini、Kimi、Qwen、GLM、MiniMax、Mimo、Hunyuan、Mistral、Grok、Llama、Nemotron、Cohere、Yi、Doubao、ERNIE、Baichuan、StepFun、Spark、InternLM、Gemma、Phi、Jamba、Solar、Sonar、Nova、Reka、Falcon、DBRX、MPT、StableLM、Aquila、EXAONE、HyperCLOVA、Luminous、Hermes、Granite、Arctic、Pangu、SenseNova、Zhinao、MiniCPM、XVERSE、Orion、OpenChat、Vicuna、Wizard、Zephyr、Dolphin、OpenOrca、Starling、BLOOM、RWKV、Aya。
 
@@ -234,7 +235,7 @@ Adapter 选择只看模型 id/name（以及 message_end 时 assistant message �
 }
 ```
 
-`message_end` 会把这些 assistant-message 字段视为权威来源。只要存在 `provider` + `model`/`responseModel` + cache usage，即使 active model 仍是 `router/auto`，统计也会更新真实上游桶。如果上游 usage 没有 cache 字段，请保持缺失或为 0；本扩展不会伪造 cache hit。
+`message_end` 会把这些 assistant-message 字段视为权威来源。只要存在 `provider` + `model`/`responseModel`，即使 active model 仍是 `router/auto`，统计也会更新真实上游桶。上游 usage 缺少 cache 字段时请保持缺失或为 0；本扩展不会伪造 cache hit。正常成功但 usage 全零的响应仍计入请求总数并标记 usage 缺失，`error` / `aborted` 的全零响应不计入请求总数。
 
 ### 可选：用于预响应 UX 的实时路由注册表
 

@@ -1,15 +1,12 @@
 import { createHash } from "node:crypto";
 import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 
 type MutableEnv = Record<string, string | undefined>;
 
 type CacheRetentionEnvSnapshot = {
-  /** 启动时是否已设置 OMP_CACHE_RETENTION 或兼容的 PI_CACHE_RETENTION */
-  wasSet: boolean;
-  value?: string;
   /** 启动时是否存在 OMP_ 键（用于 disable 时精确恢复） */
   ompWasSet: boolean;
   ompValue?: string;
@@ -23,13 +20,25 @@ const OMP_CACHE_RETENTION_ENV = "OMP_CACHE_RETENTION";
 /** 宿主 @oh-my-pi/pi-ai 仍读取 PI_CACHE_RETENTION；写入时同步镜像 */
 const PI_CACHE_RETENTION_ENV = "PI_CACHE_RETENTION";
 const LONG_CACHE_RETENTION_VALUE = "long";
+const VALID_CACHE_RETENTION_VALUES = new Set(["long", "short", "none"]);
+
+function normalizeCacheRetentionCandidate(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  if (!trimmed) return undefined;
+  return trimmed;
+}
+
+function isValidCacheRetentionValue(value: string | undefined): value is string {
+  return typeof value === "string" && VALID_CACHE_RETENTION_VALUES.has(value);
+}
 
 function readCacheRetentionValue(env: MutableEnv): string | undefined {
   // 优先 OMP_，兼容旧 PI_
-  const omp = env[OMP_CACHE_RETENTION_ENV];
-  if (typeof omp === "string" && omp.length > 0) return omp;
-  const pi = env[PI_CACHE_RETENTION_ENV];
-  if (typeof pi === "string" && pi.length > 0) return pi;
+  const omp = normalizeCacheRetentionCandidate(env[OMP_CACHE_RETENTION_ENV]);
+  if (omp) return omp;
+  const pi = normalizeCacheRetentionCandidate(env[PI_CACHE_RETENTION_ENV]);
+  if (pi) return pi;
   return undefined;
 }
 
@@ -37,8 +46,6 @@ function captureCacheRetentionEnv(env: MutableEnv = process.env): CacheRetention
   const ompWasSet = Object.prototype.hasOwnProperty.call(env, OMP_CACHE_RETENTION_ENV);
   const piWasSet = Object.prototype.hasOwnProperty.call(env, PI_CACHE_RETENTION_ENV);
   return {
-    wasSet: ompWasSet || piWasSet,
-    value: readCacheRetentionValue(env),
     ompWasSet,
     ompValue: env[OMP_CACHE_RETENTION_ENV],
     piWasSet,
@@ -46,14 +53,40 @@ function captureCacheRetentionEnv(env: MutableEnv = process.env): CacheRetention
   };
 }
 
-function requestLongCacheRetention(env: MutableEnv = process.env): void {
-  // 同时写 OMP_（用户可见主名）与 PI_（宿主 resolveCacheRetention 依赖）
-  if (env[OMP_CACHE_RETENTION_ENV] !== LONG_CACHE_RETENTION_VALUE) {
-    env[OMP_CACHE_RETENTION_ENV] = LONG_CACHE_RETENTION_VALUE;
+/**
+ * 配置缓存保留环境变量真值表（模块加载与 /enable 共用）：
+ * ① OMP 合法 → 写入 OMP + 镜像 PI
+ * ② OMP 空且 PI 合法 → 两者写 PI 规范值
+ * ③ 两者都空 → 两者 long
+ * ④ 第一个非空候选非法 → 两者原样不动
+ */
+function configureCacheRetentionEnv(env: MutableEnv = process.env): void {
+  const ompRaw = Object.prototype.hasOwnProperty.call(env, OMP_CACHE_RETENTION_ENV)
+    ? env[OMP_CACHE_RETENTION_ENV]
+    : undefined;
+  const piRaw = Object.prototype.hasOwnProperty.call(env, PI_CACHE_RETENTION_ENV)
+    ? env[PI_CACHE_RETENTION_ENV]
+    : undefined;
+  const ompCandidate = normalizeCacheRetentionCandidate(ompRaw);
+  const piCandidate = normalizeCacheRetentionCandidate(piRaw);
+
+  if (ompCandidate !== undefined) {
+    if (!isValidCacheRetentionValue(ompCandidate)) return;
+    env[OMP_CACHE_RETENTION_ENV] = ompCandidate;
+    env[PI_CACHE_RETENTION_ENV] = ompCandidate;
+    return;
   }
-  if (env[PI_CACHE_RETENTION_ENV] !== LONG_CACHE_RETENTION_VALUE) {
-    env[PI_CACHE_RETENTION_ENV] = LONG_CACHE_RETENTION_VALUE;
+
+  if (piCandidate !== undefined) {
+    if (!isValidCacheRetentionValue(piCandidate)) return;
+    env[OMP_CACHE_RETENTION_ENV] = piCandidate;
+    env[PI_CACHE_RETENTION_ENV] = piCandidate;
+    return;
   }
+
+  // 两者都空（缺失或 trim 后空）：默认 long
+  env[OMP_CACHE_RETENTION_ENV] = LONG_CACHE_RETENTION_VALUE;
+  env[PI_CACHE_RETENTION_ENV] = LONG_CACHE_RETENTION_VALUE;
 }
 
 function restoreCacheRetentionEnv(snapshot: CacheRetentionEnvSnapshot, env: MutableEnv = process.env): void {
@@ -88,7 +121,7 @@ const STARTUP_CACHE_RETENTION_ENV = captureCacheRetentionEnv();
 // 在 OMP 支持时自动请求长 prompt-cache 保留。
 // /cache-optimizer disable 会恢复本 OMP 进程启动时的值。
 // ============================================================
-requestLongCacheRetention();
+configureCacheRetentionEnv();
 
 type PiModel = NonNullable<ExtensionContext["model"]>;
 type UnknownRecord = Record<string, unknown>;
@@ -282,20 +315,19 @@ type CacheUsageSample = {
   cacheWriteInputTokens: number;
   totalInputTokens: number;
   missingUsageFields: boolean;
-  promptRewriteEnabled: boolean;
-  systemPromptFingerprint?: string;
-  promptCacheKeySource: PromptCacheKeySource;
-  hintPayloadComparison: PromptComparison;
 };
 
-type PromptCacheKeySource = "header" | "session" | "unavailable";
-type PromptComparison = "match" | "mismatch" | "unavailable";
+type PromptCacheKeySource = "header" | "project" | "custom" | "unavailable";
 
+/** Provider 请求级 prompt 诊断（内存，不与 message_end usage 强行配对）。 */
 type PromptRequestDiagnostics = {
   promptRewriteEnabled: boolean;
   systemPromptFingerprint?: string;
   promptCacheKeySource: PromptCacheKeySource;
-  hintPayloadComparison: PromptComparison;
+};
+
+type PromptDiagnosticSample = PromptRequestDiagnostics & {
+  timestamp: number;
 };
 
 type PromptRewriteContext = {
@@ -392,28 +424,159 @@ function systemPromptBlocksEqual(a: string[], b: string[]): boolean {
   return true;
 }
 
-// OpenAI prompt_cache_key 的最大长度（API 限制）。超长会被 OpenAI 拒为 400；
-// fallback 到原始 sessionId（可能为长 UUID/复合 id）时必须截断。
-const OPENAI_PROMPT_CACHE_KEY_MAX_LENGTH = 64;
+function trackPendingOperation<T>(pending: Set<Promise<unknown>>, operation: Promise<T>): Promise<T> {
+  pending.add(operation);
+  void operation.finally(() => pending.delete(operation)).catch(() => {});
+  return operation;
+}
 
-/** Trim 并截断到 OpenAI prompt_cache_key 上限；空/空白返回 undefined。 */
-function clampPromptCacheKey(key: string | undefined): string | undefined {
+async function waitForPendingOperations(pending: Set<Promise<unknown>>): Promise<void> {
+  while (pending.size > 0) {
+    await Promise.allSettled(Array.from(pending));
+  }
+}
+
+function sessionIdentityChanged(loadedSessionId: string, activeSessionId: string | undefined): boolean {
+  return typeof activeSessionId === "string" && activeSessionId.length > 0 && activeSessionId !== loadedSessionId;
+}
+
+// OpenAI prompt_cache_key 的最大长度（API 限制）。超长 key 用稳定哈希归一化，
+// 避免裸截断导致不同逻辑身份碰撞成同一 wire key。
+const OPENAI_PROMPT_CACHE_KEY_MAX_LENGTH = 64;
+const PROMPT_CACHE_KEY_HASH_PREFIX = "pc_";
+const PROMPT_CACHE_KEY_HASH_HEX_LEN = 48;
+
+/**
+ * 将逻辑 cache key 归一化为可写入 OpenAI body 的 wire 值。
+ * trim 后 ≤64 Unicode code point 原样返回；超长则 `pc_` + SHA-256 hex 前 48 位（总长 51）。
+ */
+function normalizePromptCacheKeyForWire(key: string | undefined): string | undefined {
   const normalized = key?.trim();
   if (!normalized) return undefined;
   const chars = Array.from(normalized);
   if (chars.length <= OPENAI_PROMPT_CACHE_KEY_MAX_LENGTH) return normalized;
-  return chars.slice(0, OPENAI_PROMPT_CACHE_KEY_MAX_LENGTH).join("");
+  const digest = createHash("sha256").update(normalized).digest("hex").slice(0, PROMPT_CACHE_KEY_HASH_HEX_LEN);
+  return `${PROMPT_CACHE_KEY_HASH_PREFIX}${digest}`;
 }
 
-function getSessionPromptCacheKey(ctx: ExtensionContext): string | undefined {
-  // OMP 17：宿主解析 provider-facing cache key（header.providerPromptCacheKey ?? sessionId）。
-  // cache hint 协议必须保留完整 key，防止不同长 key 因相同前缀被错误合并；仅 OpenAI
-  // request body 受 64 字符限制，注入时再通过 clampPromptCacheKey 截断。
-  const header = ctx.sessionManager.getHeader?.();
-  const providerPromptCacheKey = asRecord(header)?.providerPromptCacheKey;
-  if (isNonEmptyString(providerPromptCacheKey)) return (providerPromptCacheKey as string).trim();
-  const sessionId = ctx.sessionManager.getSessionId().trim();
-  return sessionId || undefined;
+type ResolvedPromptCacheKey = {
+  key: string;
+  source: "header" | "project" | "session";
+};
+
+function normalizePromptCacheEndpoint(baseUrl: unknown): string {
+  const raw = typeof baseUrl === "string" ? baseUrl.trim() : "";
+  if (!raw) return "";
+  try {
+    const url = new URL(raw);
+    url.username = "";
+    url.password = "";
+    url.search = "";
+    url.hash = "";
+    url.protocol = url.protocol.toLowerCase();
+    url.hostname = url.hostname.toLowerCase();
+    let pathname = url.pathname;
+    if (pathname.length > 1 && pathname.endsWith("/")) {
+      pathname = pathname.slice(0, -1);
+    }
+    return `${url.protocol}//${url.host}${pathname === "/" ? "" : pathname}`;
+  } catch {
+    return raw.replace(/\/+$/, "");
+  }
+}
+
+/** 优先 sessionManager.getCwd()，空则回退 ctx.cwd（兼容旧宿主）。 */
+function resolveProjectCwd(ctx: Pick<ExtensionContext, "cwd" | "sessionManager">): string | undefined {
+  const sessionCwd = firstNonEmptyString(
+    typeof ctx.sessionManager.getCwd === "function" ? ctx.sessionManager.getCwd() : undefined,
+  );
+  if (sessionCwd) return sessionCwd;
+  return firstNonEmptyString(ctx.cwd);
+}
+
+function buildProjectPromptCacheKey(cwd: string | undefined, model: PiModel | undefined): string | undefined {
+  if (!model || !isOpenAICompatibleApi(model.api)) return undefined;
+  const provider = lower(model.provider).trim();
+  const modelId = typeof model.id === "string" ? model.id.trim() : "";
+  if (!provider || !modelId) return undefined;
+  const projectPath = resolve(firstNonEmptyString(cwd, process.cwd())!);
+  const api = lower(model.api);
+  const endpoint = normalizePromptCacheEndpoint(model.baseUrl);
+  const input = JSON.stringify([1, projectPath, api, provider, modelId, endpoint]);
+  return `omp-cache-v1-${createHash("sha256").update(input).digest("hex").slice(0, 48)}`;
+}
+
+/**
+ * 解析应使用的 prompt_cache_key 身份。
+ * 真实 header 非空 key 一律保留；否则在允许时用项目级稳定 key。
+ * 不再猜测 providerSessionId / source 字段。
+ */
+function resolvePromptCacheKey(
+  ctx: Pick<ExtensionContext, "cwd" | "sessionManager">,
+  model: PiModel | undefined,
+  options: { allowProjectKey: boolean; allowSessionFallback: boolean },
+): ResolvedPromptCacheKey | undefined {
+  const header = asRecord(ctx.sessionManager.getHeader?.());
+  const sessionId = firstNonEmptyString(ctx.sessionManager.getSessionId());
+  const headerKey = firstNonEmptyString(header?.providerPromptCacheKey);
+  if (headerKey) {
+    return { key: headerKey, source: "header" };
+  }
+  if (options.allowProjectKey) {
+    const projectKey = buildProjectPromptCacheKey(resolveProjectCwd(ctx), model);
+    if (projectKey) return { key: projectKey, source: "project" };
+  }
+  if (options.allowSessionFallback) {
+    const sessionFallback = firstNonEmptyString(sessionId);
+    if (sessionFallback) return { key: sessionFallback, source: "session" };
+  }
+  return undefined;
+}
+
+/** 仅把等于本地 sessionId 的 body key 视为可替换 fallback。 */
+function isSessionScopedPromptCacheKey(key: string | undefined, sessionId: string | undefined): boolean {
+  return isNonEmptyString(key) && !!sessionId && key === sessionId;
+}
+
+function applyPromptCacheKeyToPayload(
+  payload: unknown,
+  cacheKey: string,
+  sessionId: string | undefined,
+): boolean {
+  const payloadRecord = asRecord(payload);
+  if (!payloadRecord) return false;
+
+  const snakeKey = isNonEmptyString(payloadRecord.prompt_cache_key)
+    ? (payloadRecord.prompt_cache_key as string).trim()
+    : undefined;
+  const camelKey = isNonEmptyString(payloadRecord.promptCacheKey)
+    ? (payloadRecord.promptCacheKey as string).trim()
+    : undefined;
+
+  if (snakeKey && camelKey && snakeKey !== camelKey) {
+    // 冲突的自定义字段保持原样，避免猜测用户意图。
+    return false;
+  }
+
+  const existingKey = snakeKey ?? camelKey;
+  if (existingKey && !isSessionScopedPromptCacheKey(existingKey, sessionId)) {
+    return false;
+  }
+
+  let mutated = false;
+  if (snakeKey === undefined && camelKey === undefined) {
+    payloadRecord.prompt_cache_key = cacheKey;
+    return true;
+  }
+  if (snakeKey !== undefined && snakeKey !== cacheKey) {
+    payloadRecord.prompt_cache_key = cacheKey;
+    mutated = true;
+  }
+  if (camelKey !== undefined && camelKey !== cacheKey) {
+    payloadRecord.promptCacheKey = cacheKey;
+    mutated = true;
+  }
+  return mutated;
 }
 
 /**
@@ -432,17 +595,20 @@ function fingerprintPrompt(prompt: string | undefined): string | undefined {
     : undefined;
 }
 
-function comparePromptFingerprints(
-  expected: string | undefined,
-  actual: string | undefined,
-): PromptComparison {
-  if (!expected || !actual) return "unavailable";
-  return expected === actual ? "match" : "mismatch";
-}
-
-function getPromptCacheKeySource(header: unknown, sessionId: string | undefined): PromptCacheKeySource {
-  if (isNonEmptyString(asRecord(header)?.providerPromptCacheKey)) return "header";
-  return sessionId ? "session" : "unavailable";
+function getPromptCacheKeySource(
+  payload: unknown,
+  api: unknown,
+  expected: ResolvedPromptCacheKey | undefined,
+): PromptCacheKeySource {
+  if (!isOpenAICompatibleApi(api)) return "unavailable";
+  const payloadRecord = asRecord(payload);
+  const effectiveKey = firstNonEmptyString(payloadRecord?.prompt_cache_key, payloadRecord?.promptCacheKey);
+  if (!effectiveKey) return "unavailable";
+  if (expected?.source === "header" || expected?.source === "project") {
+    const expectedKey = normalizePromptCacheKeyForWire(expected.key);
+    if (expectedKey && effectiveKey === expectedKey) return expected.source;
+  }
+  return "custom";
 }
 
 function getProtocolGlobal(): ProtocolGlobal {
@@ -754,7 +920,7 @@ function isPromptRewriteEnabled(env: MutableEnv = process.env): boolean {
 function setRuntimeOptimizerEnabled(enabled: boolean, env: MutableEnv = process.env): void {
   runtimeOptimizerEnabled = enabled;
   if (enabled) {
-    requestLongCacheRetention(env);
+    configureCacheRetentionEnv(env);
   } else {
     restoreCacheRetentionEnv(STARTUP_CACHE_RETENTION_ENV, env);
   }
@@ -824,7 +990,13 @@ function isDeepSeekLikeAssistantMessage(message: unknown, model: PiModel | undef
 
 function isOpenAICompatibleApi(api: unknown): boolean {
   const value = lower(api);
-  return value === "openai-completions" || value === "openai-responses";
+  return (
+    value === "openai-completions" ||
+    value === "openai-responses" ||
+    value === "openrouter" ||
+    value === "openai-codex-responses" ||
+    value === "azure-openai-responses"
+  );
 }
 
 function isOpenAICompatibleProxyApi(api: unknown): boolean {
@@ -1617,12 +1789,19 @@ function normalizeWithFallback(
 // OMP 17：主重写在 before_agent_start（string[] 块）。
 // extractSystemPrompt / setSystemPrompt 仍用于 before_provider_request 的
 // session-overview 安全网与冒烟测试。payload 形态：
+//   - openai-responses / codex / azure: payload.instructions（仅诊断指纹）
 //   - openai-completions / openai-responses: payload.messages[] role=system
 //   - anthropic-messages: payload.system（字符串或块数组）
 //   - google-generative-ai: payload.systemInstruction
 function extractSystemPrompt(payload: unknown): string | undefined {
   const record = asRecord(payload);
   if (!record) return undefined;
+
+  // openai-responses / codex / azure-openai-responses: top-level instructions
+  // （仅用于指纹诊断；Responses 族仍跳过写回改写）
+  if (typeof record.instructions === "string" && record.instructions.trim().length > 0) {
+    return record.instructions;
+  }
 
   // anthropic-messages: payload.system (string or content blocks array)
   const systemField = record.system;
@@ -1771,8 +1950,8 @@ function describeMissingOpenAIFamilyProxyCompat(_model: PiModel): string[] {
   // OMP divergence: the legacy `sendSessionAffinityHeaders` flag has no compat equivalent.
   // OMP achieves upstream stickiness via multi-credential auth + session affinity
   // in agent.db (see omp models.md §Auth). There is no required compat key for
-  // OpenAI-family proxies on OMP, so this returns an empty list. Optional long
-  // cache retention is reported separately by describeOptionalOpenAICompatibleProxyCompat.
+  // OpenAI-family proxies on OMP, so this returns an empty list.
+  // Optional long retention is provider-specific (openai-responses only).
   return [];
 }
 
@@ -1788,47 +1967,36 @@ function describeMissingOpenAICompatibleProxyCompat(_model: PiModel): string[] {
   return [];
 }
 
-function describeOptionalOpenAICompatibleProxyCompat(model: PiModel): string[] {
-  const compat = getCompat(model);
+/** 仅 openai-responses 字面量可声明 24h OpenAI prompt_cache_retention。 */
+function isOpenAIResponsesLongRetentionApi(api: unknown): boolean {
+  return lower(api) === "openai-responses";
+}
+
+/**
+ * 可选：第三方 openai-responses endpoint 的 supportsLongPromptCacheRetention。
+ * 其他 API（含 openai-completions DeepSeek）一律不建议。
+ */
+function describeOptionalOpenAIResponsesRetentionCompat(model: PiModel): string[] {
   const optional: string[] = [];
-
-  if (!isOpenAICompatibleProxyApi(model.api)) return optional;
+  if (!isOpenAIResponsesLongRetentionApi(model.api)) return optional;
   if (isOfficialOpenAIBaseUrl(model)) return optional;
-
-  if (compat.supportsLongPromptCacheRetention !== true) {
+  if (getCompat(model).supportsLongPromptCacheRetention !== true) {
     optional.push("supportsLongPromptCacheRetention");
   }
-
   return optional;
 }
 
 function buildSafeOpenAIProxyCompatSuggestion(_missing: string[]): Record<string, boolean> {
   // OMP divergence: no safe auto-fixable compat key for OpenAI-compatible proxies.
-  // supportsLongPromptCacheRetention is optional and can cause 400s, so it is NOT
+  // supportsLongPromptCacheRetention is Responses-only and can cause 400s, so it is NOT
   // auto-fixed; users must add it manually after confirming upstream support.
   return {};
 }
 
 function getPromptCacheRetentionUnsupportedHint(): string {
-  return "如果这个渠道返回 `400 Unsupported parameter: prompt_cache_retention`，请移除或避免 `supportsLongPromptCacheRetention`；扩展本身不会直接写这个字段，但当 compat 声明支持长缓存保留时，OMP 可能会发送它。";
+  return "如果第三方 openai-responses endpoint 返回 `400 Unsupported parameter: prompt_cache_retention`，请移除 `supportsLongPromptCacheRetention` 或改用支持该字段的 endpoint。扩展不会自动学习 400 或重试。";
 }
 
-function hasPromptCacheRetentionUnsupportedSignal(headers: Record<string, string> | undefined): boolean {
-  if (!headers) return false;
-
-  const normalized = Object.entries(headers)
-    .map(([key, value]) => `${lower(key)}: ${lower(value)}`)
-    .join("\n");
-  if (!normalized.includes("prompt_cache_retention")) return false;
-
-  return [
-    "unsupported parameter",
-    "unsupported_parameter",
-    "unknown parameter",
-    "not supported",
-    "unsupported field",
-  ].some((needle) => normalized.includes(needle));
-}
 
 type CompatAdvicePlacement = {
   providerLabel?: string;
@@ -1896,11 +2064,11 @@ function appendOpenAIProxyCompatAdviceLines(lines: string[], missing: string[], 
   appendCredentialSafeProviderGuidance(lines, options, suggestion);
 }
 
-function appendOptionalOpenAIProxyCompatAdviceLines(lines: string[], optional: string[]): void {
+function appendOptionalOpenAIResponsesRetentionAdviceLines(lines: string[], optional: string[]): void {
   if (!optional.includes("supportsLongPromptCacheRetention")) return;
   lines.push("");
-  lines.push("可选项（非必需，不会自动修复）：");
-  lines.push("- supportsLongPromptCacheRetention：仅当 endpoint / proxy 明确支持 OpenAI long prompt cache retention 时再开启。");
+  lines.push("可选项（非必需，不会自动修复，仅 api: openai-responses）：");
+  lines.push("- supportsLongPromptCacheRetention：仅当第三方 openai-responses endpoint 明确支持 OpenAI long prompt cache retention 时再开启。");
   lines.push(`- ${getPromptCacheRetentionUnsupportedHint()}`);
 }
 
@@ -1938,15 +2106,12 @@ function describeMissingDeepSeekCompat(model: PiModel): string[] {
   const missing: string[] = [];
 
   // OMP divergence: field names remapped (see CacheCompat).
-  //   supportsLongCacheRetention                  -> supportsLongPromptCacheRetention
   //   requiresReasoningContentOnAssistantMessages -> requiresReasoningContentForToolCalls
+  //   supportsLongPromptCacheRetention 不是 openai-completions/DeepSeek 的有效建议项
   //   sendSessionAffinityHeaders / sendSessionIdHeader -> removed (OMP multi-credential auth)
   //   thinkingFormat: "deepseek"                  -> not a valid OMP value; OMP uses
   //     openai|openrouter|zai|qwen|qwen-chat-template. DeepSeek reasoning format is
   //     auto-detected by OMP's openai-completions transport, so we no longer flag it.
-  if (compat.supportsLongPromptCacheRetention !== true) {
-    missing.push("supportsLongPromptCacheRetention");
-  }
   if (compat.requiresReasoningContentForToolCalls !== true) {
     missing.push("requiresReasoningContentForToolCalls");
   }
@@ -1971,9 +2136,6 @@ function describeMissingCacheCompatForModel(model: PiModel): string[] {
 function buildDeepSeekCompatSuggestion(missing: string[]): Record<string, unknown> {
   const suggestion: Record<string, unknown> = {};
 
-  if (missing.includes("supportsLongPromptCacheRetention")) {
-    suggestion.supportsLongPromptCacheRetention = true;
-  }
   if (missing.includes("requiresReasoningContentForToolCalls")) {
     suggestion.requiresReasoningContentForToolCalls = true;
   }
@@ -1989,10 +2151,7 @@ function appendDeepSeekCompatAdviceLines(lines: string[], missing: string[], pla
   }
 
   if (missing.includes("requiresReasoningContentForToolCalls")) {
-    lines.push("- requiresReasoningContentForToolCalls：保持带工具调用的 assistant 重放与 DeepSeek 的 reasoning_content 要求兼容。");
-  }
-  if (missing.includes("supportsLongPromptCacheRetention")) {
-    lines.push("- supportsLongPromptCacheRetention：仅当 DeepSeek 兼容 endpoint 支持长缓存保留时再开启。");
+    lines.push("- requiresReasoningContentForToolCalls：DeepSeek 工具调用场景需要 assistant 消息携带 reasoning 内容。");
   }
 
   appendCredentialSafeProviderGuidance(lines, placement, suggestion);
@@ -3063,11 +3222,30 @@ function formatTokenHitPercent(stats: CacheStats): string {
   return `${Math.round((stats.cachedInputTokens / stats.totalInputTokens) * 100)}%`;
 }
 /**
- * Footer 文案：三项均带中文说明，主指标为 token 命中率。
- * 例：`OpenAI Cache | 缓存命中率：40% | 缓存请求命中次数：1/2 次 | 缓存token/总输入：800/2.00k`
+ * Footer 文案：三项均带中文说明，主指标为 token 命中率；
+ * 有近期有效样本时追加最近 N 次 token 命中率。
+ * 例：`OpenAI Cache | 缓存命中率：40% | 最近2次token命中率：40% | 缓存请求命中次数：1/2 次 | 缓存token/总输入：800/2.00k`
  */
-function formatCacheStats(adapter: CacheProviderAdapter, stats: CacheStats): string {
+function formatRecentTokenHitRate(
+  samples: CacheUsageSample[],
+  maxCount: number,
+): string | undefined {
+  const recent = samples.slice(-maxCount);
+  const valid = recent.filter((sample) => !sample.missingUsageFields && sample.totalInputTokens > 0);
+  if (valid.length === 0) return undefined;
+  const recentStats = emptyCacheStats();
+  recentStats.cachedInputTokens = valid.reduce((sum, sample) => sum + sample.cachedInputTokens, 0);
+  recentStats.totalInputTokens = valid.reduce((sum, sample) => sum + sample.totalInputTokens, 0);
+  return `最近${valid.length}次token命中率：${formatTokenHitPercent(recentStats)}`;
+}
+
+function formatCacheStats(
+  adapter: CacheProviderAdapter,
+  stats: CacheStats,
+  recentSamples: CacheUsageSample[] = [],
+): string {
   const tokenHit = formatTokenHitPercent(stats);
+  const recentHit = formatRecentTokenHitRate(recentSamples, 10);
   const tok = `${formatTokenCount(stats.cachedInputTokens)}/${formatTokenCount(stats.totalInputTokens)}`;
   const req = `${stats.hitRequests}/${stats.totalRequests}`;
   const writeText = adapter.showCacheWrite && stats.cacheWriteInputTokens > 0
@@ -3077,6 +3255,7 @@ function formatCacheStats(adapter: CacheProviderAdapter, stats: CacheStats): str
   return (
     `${localizeAdapterLabel(adapter.label)}` +
     ` | 缓存命中率：${tokenHit}` +
+    (recentHit ? ` | ${recentHit}` : "") +
     ` | 缓存请求命中次数：${req} 次` +
     ` | 缓存token/总输入：${tok}` +
     writeText
@@ -3116,19 +3295,22 @@ function hasMissingUsageFields(message: unknown, adapter: CacheProviderAdapter):
   return false;
 }
 
-function formatRecentPromptDiagnostics(samples: CacheUsageSample[], maxCount: number): string | undefined {
+function formatRecentPromptDiagnostics(samples: PromptDiagnosticSample[], maxCount: number): string | undefined {
   const recent = samples.slice(-maxCount);
   if (recent.length === 0) return undefined;
   const rewriteEnabled = recent.filter((sample) => sample.promptRewriteEnabled).length;
-  const fingerprints = new Set(recent.flatMap((sample) => sample.systemPromptFingerprint ? [sample.systemPromptFingerprint] : []));
+  const fingerprints = new Set(
+    recent.flatMap((sample) => (sample.systemPromptFingerprint ? [sample.systemPromptFingerprint] : [])),
+  );
   const headerKeys = recent.filter((sample) => sample.promptCacheKeySource === "header").length;
-  const sessionKeys = recent.filter((sample) => sample.promptCacheKeySource === "session").length;
-  const mismatches = recent.filter((sample) => sample.hintPayloadComparison === "mismatch").length;
-  const unavailable = recent.filter((sample) => sample.hintPayloadComparison === "unavailable").length;
-  let result = `Prompt 诊断（最近 ${recent.length} 次）：改写开启 ${rewriteEnabled}/${recent.length} · system 指纹 ${fingerprints.size} 组 · cache key 来源 header ${headerKeys} / session ${sessionKeys}`;
-  if (mismatches > 0) result += ` · hint/payload 不一致 ${mismatches}`;
-  if (unavailable > 0) result += ` · 不可比较 ${unavailable}`;
-  return result;
+  const projectKeys = recent.filter((sample) => sample.promptCacheKeySource === "project").length;
+  const customKeys = recent.filter((sample) => sample.promptCacheKeySource === "custom").length;
+  const missingKeys = recent.filter((sample) => sample.promptCacheKeySource === "unavailable").length;
+  return (
+    `Prompt 诊断（最近 ${recent.length} 次 provider 请求）：改写开启 ${rewriteEnabled}/${recent.length}` +
+    ` · system 指纹 ${fingerprints.size} 组` +
+    ` · provider body cache key header ${headerKeys} / 项目稳定 ${projectKeys} / 自定义 ${customKeys} / 未注入 ${missingKeys}`
+  );
 }
 
 function formatRecentTrendSummary(samples: CacheUsageSample[], maxCount: number): string {
@@ -3149,7 +3331,13 @@ function formatRecentTrendSummary(samples: CacheUsageSample[], maxCount: number)
   return result;
 }
 
-function buildStatsOutput(model: PiModel | undefined, adapter: CacheProviderAdapter | undefined, stats: CacheStats | undefined, recentSamples: CacheUsageSample[]): string {
+function buildStatsOutput(
+  model: PiModel | undefined,
+  adapter: CacheProviderAdapter | undefined,
+  stats: CacheStats | undefined,
+  usageSamples: CacheUsageSample[],
+  promptSamples: PromptDiagnosticSample[] = [],
+): string {
   const lines: string[] = [];
 
   if (!model || !adapter) {
@@ -3164,13 +3352,17 @@ function buildStatsOutput(model: PiModel | undefined, adapter: CacheProviderAdap
   lines.push(`适配器：${localizeAdapterLabel(adapter.label)}`);
   lines.push("");
   lines.push("── 今日 ──");
-  lines.push(`请求数：${currentStats.hitRequests} 次命中 / ${currentStats.totalRequests} 次总计 · ${formatHitRatio(currentStats.hitRequests, currentStats.totalRequests)}`);
-  lines.push(`缓存 tokens：${formatTokenM(currentStats.cachedInputTokens)}M / ${formatTokenM(currentStats.totalInputTokens)}M 输入 · ${currentStats.totalInputTokens > 0 ? `${Math.round((currentStats.cachedInputTokens / currentStats.totalInputTokens) * 100)}%` : "无数据"}`);
+  lines.push(
+    `请求数：${currentStats.hitRequests} 次命中 / ${currentStats.totalRequests} 次总计 · ${formatHitRatio(currentStats.hitRequests, currentStats.totalRequests)}`,
+  );
+  lines.push(
+    `缓存 tokens：${formatTokenM(currentStats.cachedInputTokens)}M / ${formatTokenM(currentStats.totalInputTokens)}M 输入 · ${currentStats.totalInputTokens > 0 ? `${Math.round((currentStats.cachedInputTokens / currentStats.totalInputTokens) * 100)}%` : "无数据"}`,
+  );
   if (currentStats.cacheWriteInputTokens > 0) {
     lines.push(`缓存写入：${formatTokenM(currentStats.cacheWriteInputTokens)}M tok`);
   }
 
-  const promptDiagnostics = formatRecentPromptDiagnostics(recentSamples, 10);
+  const promptDiagnostics = formatRecentPromptDiagnostics(promptSamples, 10);
   if (promptDiagnostics) {
     lines.push("");
     lines.push(promptDiagnostics);
@@ -3179,10 +3371,10 @@ function buildStatsOutput(model: PiModel | undefined, adapter: CacheProviderAdap
 
   lines.push("");
   lines.push("── 近期趋势 ──");
-  lines.push(formatRecentTrendSummary(recentSamples, 10));
-  lines.push(formatRecentTrendSummary(recentSamples, 30));
+  lines.push(formatRecentTrendSummary(usageSamples, 10));
+  lines.push(formatRecentTrendSummary(usageSamples, 30));
 
-  const missingAny = recentSamples.some((s) => s.missingUsageFields);
+  const missingAny = usageSamples.some((s) => s.missingUsageFields);
   if (missingAny) {
     lines.push("");
     lines.push("⚠️ 近期有响应缺少或返回了空的缓存 usage 字段，footer 命中率可能偏低。");
@@ -3595,11 +3787,6 @@ function isCompatCheckApplicable(model: PiModel): boolean {
   return isOpenAICompatibleProxyApi(model.api) && !isOfficialOpenAIBaseUrl(model);
 }
 
-function isPromptCacheRetention400Applicable(model: PiModel): boolean {
-  return isOpenAICompatibleApi(model.api) &&
-    !isOfficialOpenAIBaseUrl(model) &&
-    getCompat(model).supportsLongPromptCacheRetention === true;
-}
 
 /**
  * Detect router / channel profiles from a PiModel and return diagnostic notes.
@@ -3653,15 +3840,12 @@ function describeRouterChannelDiagnostics(model: PiModel): string[] {
       notes.push(
         '   建议：添加 openRouterRouting，把上游固定住。位置：models.yml -> providers["<providerId>"] -> compat：',
       );
-      notes.push(
-        `   { "supportsLongPromptCacheRetention": true, ` +
-        `"openRouterRouting": { "only": ["<provider-slug>"] } }`,
-      );
+      notes.push(`   { "openRouterRouting": { "only": ["<provider-slug>"] } }`);
       notes.push(
         '   把 <provider-slug> 替换成真实的 OpenRouter provider slug（如 "openai"、"anthropic"）。',
       );
       notes.push(
-        '   也可以用 openRouterRouting.order: ["<provider-slug>", "..."] 作为回退顺序。只有在上游支持长缓存保留时才设置 supportsLongPromptCacheRetention。',
+        '   也可以用 openRouterRouting.order: ["<provider-slug>", "..."] 作为回退顺序。',
       );
     }
 
@@ -3686,16 +3870,8 @@ function describeRouterChannelDiagnostics(model: PiModel): string[] {
       notes.push(
         '   建议：添加 vercelGatewayRouting，把上游固定住。位置：models.yml -> providers["<providerId>"] -> compat：',
       );
-      notes.push(
-        `   { "supportsLongPromptCacheRetention": true, ` +
-        `"vercelGatewayRouting": { "only": ["<provider-id>"] } }`,
-      );
-      notes.push(
-        '   把 <provider-id> 替换成真实的 Vercel provider ID（如 "openai"）。',
-      );
-      notes.push(
-        "   只有在上游支持长缓存保留时才设置 supportsLongPromptCacheRetention。",
-      );
+      notes.push(`   { "vercelGatewayRouting": { "only": ["<provider-id>"] } }`);
+      notes.push('   把 <provider-id> 替换成真实的 Vercel provider ID（如 "openai"）。');
     }
 
     return notes;
@@ -3713,8 +3889,6 @@ function describeRouterChannelDiagnostics(model: PiModel): string[] {
     notes.push("   • 确保代理能按 session 固定到单一上游（session_id affinity）。");
     notes.push("   • 向上游透传 prompt_cache_key 与会话亲和性相关 header。");
     notes.push("   • 在响应里返回缓存 usage 字段（如 prompt_cache_hit_tokens）。");
-    notes.push(`   可作为起点的 compat：{ "supportsLongPromptCacheRetention": true }`);
-    notes.push("   只有在代理明确支持 prompt_cache_retention 时才加 supportsLongPromptCacheRetention。");
 
     return notes;
   }
@@ -3762,7 +3936,7 @@ function getCompatCheckNotApplicableLines(model: PiModel): string[] {
   return ["ℹ️ 当前模型不适用 compat 检查。"];
 }
 
-function buildDoctorDiagnosis(model: PiModel, options: { promptCacheRetention400?: boolean } = {}): string {
+function buildDoctorDiagnosis(model: PiModel): string {
   const lines: string[] = [];
   lines.push(`提供方：${model.provider}`);
   lines.push(`模型：    ${model.id}`);
@@ -3776,12 +3950,12 @@ function buildDoctorDiagnosis(model: PiModel, options: { promptCacheRetention400
   const adaptiveThinkingApplicable = isAdaptiveThinkingCompatApplicable(model);
   const deepSeekCompatApplicable = isDeepSeekCompatCheckApplicable(model);
   const missing = describeMissingCacheCompatForModel(model);
-  const optionalOpenAIProxyCompat = (!adaptiveThinkingApplicable && !deepSeekCompatApplicable)
-    ? describeOptionalOpenAICompatibleProxyCompat(model)
+  const optionalResponsesRetention = (!adaptiveThinkingApplicable && !deepSeekCompatApplicable)
+    ? describeOptionalOpenAIResponsesRetentionCompat(model)
     : [];
   const fixSug = buildFixSuggestion(model);
   const safeFixableMissing = fixSug ? Object.keys(fixSug.compatKeys) : [];
-  const advisoryMissing = missing.filter(m => !safeFixableMissing.includes(m));
+  const advisoryMissing = missing.filter((m) => !safeFixableMissing.includes(m));
 
   if (safeFixableMissing.length > 0) {
     lines.push(`⚠️ 缺少 compat 字段：${safeFixableMissing.join(", ")}`);
@@ -3802,23 +3976,19 @@ function buildDoctorDiagnosis(model: PiModel, options: { promptCacheRetention400
       appendDeepSeekCompatAdviceLines(lines, missing, { providerLabel, modelId: model.id });
     } else {
       appendOpenAIProxyCompatAdviceLines(lines, missing, { providerLabel, modelId: model.id });
-      appendOptionalOpenAIProxyCompatAdviceLines(lines, optionalOpenAIProxyCompat);
+      appendOptionalOpenAIResponsesRetentionAdviceLines(lines, optionalResponsesRetention);
     }
   } else if (adaptiveThinkingApplicable || deepSeekCompatApplicable || isCompatCheckApplicable(model)) {
     lines.push("✅ compat 配置完整。");
-    appendOptionalOpenAIProxyCompatAdviceLines(lines, optionalOpenAIProxyCompat);
+    appendOptionalOpenAIResponsesRetentionAdviceLines(lines, optionalResponsesRetention);
   } else {
     lines.push(...getCompatCheckNotApplicableLines(model));
+    appendOptionalOpenAIResponsesRetentionAdviceLines(lines, optionalResponsesRetention);
   }
 
-  if (isPromptCacheRetention400Applicable(model)) {
+  if (isOpenAIResponsesLongRetentionApi(model.api) && getCompat(model).supportsLongPromptCacheRetention === true) {
     lines.push("");
-    if (options.promptCacheRetention400) {
-      lines.push("⚠️ 在启用 supportsLongPromptCacheRetention 时观测到一次 400 响应。");
-      lines.push(`   ${getPromptCacheRetentionUnsupportedHint()}`);
-    } else {
-      lines.push(`ℹ️ 已启用长缓存保留。${getPromptCacheRetentionUnsupportedHint()}`);
-    }
+    lines.push(`ℹ️ 已启用 openai-responses 长缓存保留。${getPromptCacheRetentionUnsupportedHint()}`);
   }
 
   const routerNotes = describeRouterChannelDiagnostics(model);
@@ -3836,34 +4006,39 @@ function buildLowHitDiagnosis(
   model: PiModel,
   adapter: CacheProviderAdapter | undefined,
   stats: CacheStats | undefined,
-  samples: CacheUsageSample[],
+  usageSamples: CacheUsageSample[],
+  promptSamples: PromptDiagnosticSample[] = [],
 ): string[] {
+  void adapter;
   const lines: string[] = [];
 
   const fixSugLHD = buildFixSuggestion(model);
   const safeFixableMissingLHD = fixSugLHD ? Object.keys(fixSugLHD.compatKeys) : [];
   const routerNotes = describeRouterChannelDiagnostics(model);
-  const missingUsageSamples = samples.filter((s) => s.missingUsageFields).length;
-  const recent10 = samples.slice(-10);
+  const missingUsageSamples = usageSamples.filter((s) => s.missingUsageFields).length;
+  const recent10 = usageSamples.slice(-10);
   const recent10Hits = recent10.filter((s) => s.hit).length;
   const recent10Total = recent10.length;
-  const recent10Cached = recent10.reduce((sum, s) => sum + s.cachedInputTokens, 0);
-  const recent10Input = recent10.reduce((sum, s) => sum + s.totalInputTokens, 0);
   const todayStats = stats ?? emptyCacheStats();
-  const promptMismatchSamples = recent10.filter((sample) => sample.hintPayloadComparison === "mismatch").length;
-  const promptFingerprints = new Set(recent10.flatMap((sample) => sample.systemPromptFingerprint ? [sample.systemPromptFingerprint] : []));
+  const recentPrompt = promptSamples.slice(-10);
+  const promptFingerprints = new Set(
+    recentPrompt.flatMap((sample) => (sample.systemPromptFingerprint ? [sample.systemPromptFingerprint] : [])),
+  );
 
   const hasMissingCompat = safeFixableMissingLHD.length > 0;
   const hasRouterRisk = routerNotes.length > 0;
-
   const hasUsageMissing = missingUsageSamples > 0;
-  const todayHitRatio = todayStats.totalInputTokens > 0
-    ? Math.round((todayStats.cachedInputTokens / todayStats.totalInputTokens) * 100)
-    : 0;
+  const todayHitRatio =
+    todayStats.totalInputTokens > 0
+      ? Math.round((todayStats.cachedInputTokens / todayStats.totalInputTokens) * 100)
+      : 0;
 
-  const hasActualIssues = hasMissingCompat || hasUsageMissing ||
-    (todayStats.totalRequests > 3 && todayStats.totalInputTokens > 0 &&
-     (todayStats.cachedInputTokens / todayStats.totalInputTokens) < 0.3) ||
+  const hasActualIssues =
+    hasMissingCompat ||
+    hasUsageMissing ||
+    (todayStats.totalRequests > 3 &&
+      todayStats.totalInputTokens > 0 &&
+      todayStats.cachedInputTokens / todayStats.totalInputTokens < 0.3) ||
     (recent10Total >= 3 && recent10Hits === 0);
 
   if (!hasActualIssues && !(hasRouterRisk && (hasMissingCompat || hasUsageMissing))) {
@@ -3872,12 +4047,8 @@ function buildLowHitDiagnosis(
 
   lines.push("");
   lines.push("── 缓存诊断 ──");
-  if (promptMismatchSamples > 0) {
-    lines.push(`⚠️ 最近 ${recent10Total} 条请求中有 ${promptMismatchSamples} 条的发送 system prompt 与 cache hint 不一致。`);
-    lines.push("   这通常表示后续 extension 或宿主在 hint 发布后修改了 prompt，可能导致 provider cache 前缀失效。");
-  }
   if (promptFingerprints.size > 1) {
-    lines.push(`ℹ️ 最近 ${recent10Total} 条请求观测到 ${promptFingerprints.size} 组 system prompt 指纹。`);
+    lines.push(`ℹ️ 最近 ${recentPrompt.length} 条 provider 请求观测到 ${promptFingerprints.size} 组 system prompt 指纹。`);
     lines.push("   若低命中持续，请避免在同一实验窗口混用不同 prompt 模式或动态 system 内容。");
   }
 
@@ -3892,7 +4063,7 @@ function buildLowHitDiagnosis(
   }
 
   if (hasUsageMissing) {
-    lines.push(`⚠️ 最近 ${samples.length} 条样本里有 ${missingUsageSamples} 条缺少或返回了空的 usage 字段。`);
+    lines.push(`⚠️ 最近 ${usageSamples.length} 条样本里有 ${missingUsageSamples} 条缺少或返回了空的 usage 字段。`);
     lines.push("   Footer 命中率可能会被低估。");
     lines.push("   请确认代理会返回 prompt 级 usage（如 prompt_tokens、input_tokens_details）。");
   }
@@ -3901,15 +4072,14 @@ function buildLowHitDiagnosis(
     if (recent10Hits === 0 && todayStats.totalRequests > 3 && todayHitRatio < 30) {
       lines.push(`📉 今日缓存命中率偏低：${todayHitRatio}%（最近 ${recent10Total} 条样本）。`);
       lines.push("   常见原因：代理把请求路由到不同后端，或 prompt 前缀在各轮之间变化。");
-      lines.push("   请检查上游路由粘性，以及 supportsLongPromptCacheRetention 配置是否正确。");
+      lines.push("   请检查上游路由粘性与 prompt 前缀稳定性。");
     } else if (todayHitRatio < 30 && todayStats.totalRequests > 3) {
       lines.push(`📉 今日缓存命中率偏低：${todayHitRatio}%（共 ${todayStats.totalRequests} 次请求）。`);
       lines.push("   请检查 compat 配置与代理上游路由。");
     }
 
     if (recent10Total >= 3) {
-      const trend = formatRecentTrendSummary(samples, 10);
-      lines.push(`📊 ${trend}`);
+      lines.push(`📊 ${formatRecentTrendSummary(usageSamples, 10)}`);
     }
   }
 
@@ -3928,15 +4098,15 @@ function buildCompatDiagnosis(model: PiModel): string | undefined {
   const missing = describeMissingCacheCompatForModel(model);
   const fixSugC = buildFixSuggestion(model);
   const safeFixableMissingC = fixSugC ? Object.keys(fixSugC.compatKeys) : [];
-  const advisoryMissingC = missing.filter(m => !safeFixableMissingC.includes(m));
+  const advisoryMissingC = missing.filter((m) => !safeFixableMissingC.includes(m));
   const adaptiveThinkingApplicable = isAdaptiveThinkingCompatApplicable(model);
   const deepSeekCompatApplicable = isDeepSeekCompatCheckApplicable(model);
-  const optionalOpenAIProxyCompat = (!adaptiveThinkingApplicable && !deepSeekCompatApplicable)
-    ? describeOptionalOpenAICompatibleProxyCompat(model)
+  const optionalResponsesRetention = (!adaptiveThinkingApplicable && !deepSeekCompatApplicable)
+    ? describeOptionalOpenAIResponsesRetentionCompat(model)
     : [];
   const routerNotes = describeRouterChannelDiagnostics(model);
 
-  if (missing.length === 0 && routerNotes.length === 0 && optionalOpenAIProxyCompat.length === 0) return undefined;
+  if (missing.length === 0 && routerNotes.length === 0 && optionalResponsesRetention.length === 0) return undefined;
 
   const key = modelKey(model);
   const lines: string[] = [];
@@ -3961,19 +4131,17 @@ function buildCompatDiagnosis(model: PiModel): string | undefined {
       appendDeepSeekCompatAdviceLines(lines, missing, { providerLabel, modelId: model.id });
     } else {
       appendOpenAIProxyCompatAdviceLines(lines, missing, { providerLabel, modelId: model.id });
-      appendOptionalOpenAIProxyCompatAdviceLines(lines, optionalOpenAIProxyCompat);
+      appendOptionalOpenAIResponsesRetentionAdviceLines(lines, optionalResponsesRetention);
     }
   }
 
-  if ((routerNotes.length > 0 || optionalOpenAIProxyCompat.length > 0) && missing.length === 0) {
+  if ((routerNotes.length > 0 || optionalResponsesRetention.length > 0) && missing.length === 0) {
     if (adaptiveThinkingApplicable || deepSeekCompatApplicable || isCompatCheckApplicable(model)) {
       lines.push("✅ compat 配置完整。");
-      if (isPromptCacheRetention400Applicable(model)) {
-        lines.push(getPromptCacheRetentionUnsupportedHint());
-      }
-      appendOptionalOpenAIProxyCompatAdviceLines(lines, optionalOpenAIProxyCompat);
+      appendOptionalOpenAIResponsesRetentionAdviceLines(lines, optionalResponsesRetention);
     } else {
       lines.push(...getCompatCheckNotApplicableLines(model));
+      appendOptionalOpenAIResponsesRetentionAdviceLines(lines, optionalResponsesRetention);
     }
     lines.push("");
   }
@@ -4054,8 +4222,13 @@ export const __internals_for_tests = {
   PROMPT_REWRITE_ENV,
   isEnabledEnv,
   fingerprintPrompt,
-  comparePromptFingerprints,
   getPromptCacheKeySource,
+  buildProjectPromptCacheKey,
+  resolveProjectCwd,
+  resolvePromptCacheKey,
+  applyPromptCacheKeyToPayload,
+  normalizePromptCacheKeyForWire,
+  formatRecentTokenHitRate,
   isNonEmptyString,
   isOpenAICompatibleApi,
   isOpenAICompatibleProxyApi,
@@ -4066,7 +4239,7 @@ export const __internals_for_tests = {
   isOpenAIFamilyToken,
   describeMissingOpenAIFamilyProxyCompat,
   describeMissingOpenAICompatibleProxyCompat,
-  describeOptionalOpenAICompatibleProxyCompat,
+  describeOptionalOpenAIResponsesRetentionCompat,
   describeMissingDeepSeekCompat,
   isDeepSeekCompatCheckApplicable,
   describeMissingCacheCompatForModel,
@@ -4076,8 +4249,7 @@ export const __internals_for_tests = {
   getPromptCacheRetentionUnsupportedHint,
   isOfficialOpenAIBaseUrl,
   isCompatCheckApplicable,
-  isPromptCacheRetention400Applicable,
-  hasPromptCacheRetentionUnsupportedSignal,
+  isOpenAIResponsesLongRetentionApi,
   // Non-GPT OpenAI-compatible model detection
   isKimiLikeModel,
   isKimiLikeAssistantMessage,
@@ -4199,7 +4371,7 @@ export const __internals_for_tests = {
   buildProviderCompatOverride,
   buildModelCompatOverride,
   captureCacheRetentionEnv,
-  requestLongCacheRetention,
+  configureCacheRetentionEnv,
   restoreCacheRetentionEnv,
   setRuntimeOptimizerEnabled,
   isRuntimeOptimizerEnabled,
@@ -4224,6 +4396,7 @@ export const __internals_for_tests = {
   buildStatsOutput,
   buildLowHitDiagnosis,
   formatRecentTrendSummary,
+  formatRecentPromptDiagnostics,
   formatHitRatio,
   formatTokenM,
   hasMissingUsageFields,
@@ -4240,6 +4413,9 @@ export const __internals_for_tests = {
   parsePersistedRoutedModelRef,
   routedModelRefToPiModel,
   buildExactRouterStatusEntry,
+  trackPendingOperation,
+  waitForPendingOperations,
+  sessionIdentityChanged,
   // Routing-provider protocol helpers
   PI_ROUTING_REGISTRY_SYMBOL,
   PI_CACHE_HINTS_SYMBOL,
@@ -4283,8 +4459,6 @@ export const __internals_for_tests = {
 
 export default function (pi: ExtensionAPI) {
   const warnedModels = new Set<string>();
-  const promptCacheRetention400Models = new Set<string>();
-  const warnedPromptCacheRetention400Models = new Set<string>();
   let cacheStatsByModel: Record<string, CacheStats> = {};
   let cacheStatsLegacyFamily: Partial<Record<CacheProviderId, CacheStats>> = emptyAllCacheStats();
   let lastStatusText: string | undefined;
@@ -4301,8 +4475,11 @@ export default function (pi: ExtensionAPI) {
   const PERSIST_DEBOUNCE_MS = 2000;
   /** In-memory recent usage samples per model key (not persisted, cleared on reload). */
   const recentSamplesByModelKey = new Map<string, CacheUsageSample[]>();
-  /** Per-request diagnostics awaiting the corresponding message_end event; never persisted. */
-  const pendingRequestDiagnosticsByModelKey = new Map<string, PromptRequestDiagnostics>();
+  /** Provider-request prompt diagnostics (memory only; not paired with message_end usage). */
+  const recentPromptDiagnosticsByModelKey = new Map<string, PromptDiagnosticSample[]>();
+  /** message_end is fire-and-forget in agent-core; session_switch waits on this barrier. */
+  const pendingMessageEndOperations = new Set<Promise<unknown>>();
+  let sessionStatsSyncOperation: Promise<void> | undefined;
 
   function syncSessionHash(ctx: Pick<ExtensionContext, "sessionManager">): void {
     const sid = ctx.sessionManager.getSessionId();
@@ -4311,6 +4488,27 @@ export default function (pi: ExtensionAPI) {
       currentSessionHash = hashSessionId(sid);
       currentSessionHashSet = true;
       lastActualRoutedModel = undefined;
+    }
+  }
+
+  async function ensureActiveSessionStats(ctx: ExtensionContext): Promise<void> {
+    if (!currentSessionHashSet) {
+      syncSessionHash(ctx);
+      return;
+    }
+    while (sessionIdentityChanged(currentSessionId, ctx.sessionManager.getSessionId())) {
+      if (!sessionStatsSyncOperation) {
+        const operation = (async () => {
+          if (currentSessionHashSet) await flushPersistCacheStats(ctx);
+          await restoreCacheStats(ctx);
+          lastModelKeyForStatus = undefined;
+        })();
+        sessionStatsSyncOperation = operation;
+        void operation.finally(() => {
+          if (sessionStatsSyncOperation === operation) sessionStatsSyncOperation = undefined;
+        }).catch(() => {});
+      }
+      await sessionStatsSyncOperation;
     }
   }
 
@@ -4358,7 +4556,6 @@ export default function (pi: ExtensionAPI) {
     modelKeyStr: string,
     usage: UsageSnapshot,
     missingUsageFields: boolean,
-    diagnostics: PromptRequestDiagnostics | undefined,
   ): void {
     let samples = recentSamplesByModelKey.get(modelKeyStr);
     if (!samples) {
@@ -4372,10 +4569,6 @@ export default function (pi: ExtensionAPI) {
       cacheWriteInputTokens: usage.cacheWrite,
       totalInputTokens: usage.totalInput,
       missingUsageFields,
-      promptRewriteEnabled: diagnostics?.promptRewriteEnabled ?? isPromptRewriteEnabled(),
-      systemPromptFingerprint: diagnostics?.systemPromptFingerprint,
-      promptCacheKeySource: diagnostics?.promptCacheKeySource ?? "unavailable",
-      hintPayloadComparison: diagnostics?.hintPayloadComparison ?? "unavailable",
     });
     if (samples.length > MAX_RECENT_SAMPLES) {
       samples.splice(0, samples.length - MAX_RECENT_SAMPLES);
@@ -4386,9 +4579,43 @@ export default function (pi: ExtensionAPI) {
     return recentSamplesByModelKey.get(modelKeyStr) ?? [];
   }
 
-  function clearRecentSamples(): void {
-    recentSamplesByModelKey.clear();
-    pendingRequestDiagnosticsByModelKey.clear();
+  function recordPromptDiagnosticSample(
+    modelKeyStr: string,
+    diagnostics: PromptRequestDiagnostics,
+  ): void {
+    let samples = recentPromptDiagnosticsByModelKey.get(modelKeyStr);
+    if (!samples) {
+      samples = [];
+      recentPromptDiagnosticsByModelKey.set(modelKeyStr, samples);
+    }
+    samples.push({
+      timestamp: Date.now(),
+      promptRewriteEnabled: diagnostics.promptRewriteEnabled,
+      systemPromptFingerprint: diagnostics.systemPromptFingerprint,
+      promptCacheKeySource: diagnostics.promptCacheKeySource,
+    });
+    if (samples.length > MAX_RECENT_SAMPLES) {
+      samples.splice(0, samples.length - MAX_RECENT_SAMPLES);
+    }
+  }
+
+  function getRecentPromptDiagnostics(modelKeyStr: string): PromptDiagnosticSample[] {
+    return recentPromptDiagnosticsByModelKey.get(modelKeyStr) ?? [];
+  }
+
+  function retainRecentSamplesForSession(sessionHash: string | undefined): void {
+    if (!sessionHash) {
+      recentSamplesByModelKey.clear();
+      recentPromptDiagnosticsByModelKey.clear();
+      return;
+    }
+    const prefix = `${sessionHash}:`;
+    for (const key of recentSamplesByModelKey.keys()) {
+      if (!key.startsWith(prefix)) recentSamplesByModelKey.delete(key);
+    }
+    for (const key of recentPromptDiagnosticsByModelKey.keys()) {
+      if (!key.startsWith(prefix)) recentPromptDiagnosticsByModelKey.delete(key);
+    }
   }
 
   function getCacheStatsState(): CacheStatsState {
@@ -4433,6 +4660,7 @@ export default function (pi: ExtensionAPI) {
     const sk = sessionModelKey(model);
     delete cacheStatsByModel[sk];
     recentSamplesByModelKey.delete(sk);
+    recentPromptDiagnosticsByModelKey.delete(sk);
     lastStatusText = undefined;
   }
 
@@ -4443,6 +4671,9 @@ export default function (pi: ExtensionAPI) {
     }
     for (const key of Array.from(recentSamplesByModelKey.keys())) {
       if (key.startsWith(prefix)) recentSamplesByModelKey.delete(key);
+    }
+    for (const key of Array.from(recentPromptDiagnosticsByModelKey.keys())) {
+      if (key.startsWith(prefix)) recentPromptDiagnosticsByModelKey.delete(key);
     }
     lastActualRoutedModel = undefined;
     lastStatusText = undefined;
@@ -4515,33 +4746,14 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
-  async function restoreCacheStats(reason: string, ctx: ExtensionContext): Promise<void> {
+  async function restoreCacheStats(ctx: ExtensionContext): Promise<void> {
     syncSessionHash(ctx);
+    lastStatusText = undefined;
+    retainRecentSamplesForSession(currentSessionHashSet ? currentSessionHash : undefined);
 
-    if (reason === "reload") {
-      // /reload: preserve session-scoped stats (same session hash).
-      // OMP extension reload creates a fresh closure, so cacheStatsByModel
-      // starts empty. Read persisted data and filter for current session.
-      lastStatusText = undefined;
-      clearRecentSamples();
-
-      const persisted = await readPersistedCacheStats();
-      cacheStatsByModel = filterRestorableStatsForSession(
-        persisted,
-        currentSessionHashSet ? currentSessionHash : undefined,
-      );
-      cacheStatsLegacyFamily = persisted?.legacyFamily ?? emptyAllCacheStats();
-      lastActualRoutedModel = currentSessionHashSet
-        ? persisted?.lastRoutedModelBySession?.[currentSessionHash]
-        : undefined;
-
-      await rollOverStatsIfNeeded(ctx);
-      return;
-    }
-
-    // First load / process start: read persisted stats and filter for
-    // this session's entries. If the session hash is unavailable, start
-    // fresh instead of loading all persisted session buckets.
+    // session_start and session_switch both arrive after the active SessionManager
+    // is ready. Restore only the active session bucket; never leak another
+    // session's in-memory totals or routed-model footer across a switch.
     const persisted = await readPersistedCacheStats();
     cacheStatsByModel = filterRestorableStatsForSession(
       persisted,
@@ -4551,7 +4763,6 @@ export default function (pi: ExtensionAPI) {
     lastActualRoutedModel = currentSessionHashSet
       ? persisted?.lastRoutedModelBySession?.[currentSessionHash]
       : undefined;
-    lastStatusText = undefined;
     await rollOverStatsIfNeeded(ctx);
   }
 
@@ -4606,7 +4817,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   async function publishStatus(ctx: ExtensionContext, model: PiModel | undefined = ctx.model): Promise<void> {
-    syncSessionHash(ctx);
+    await ensureActiveSessionStats(ctx);
     await rollOverStatsIfNeeded(ctx);
 
     const routedModel = resolveRouteModel(model, ctx);
@@ -4622,13 +4833,17 @@ export default function (pi: ExtensionAPI) {
       // for this session when available; fall back to older best-effort
       // heuristics only when no exact metadata exists.
       if (lastStatusText !== undefined) return;
-      const realEntry = buildExactRouterStatusEntry(
+      const exactEntry = buildExactRouterStatusEntry(
         currentSessionHashSet ? currentSessionHash : undefined,
         cacheStatsByModel,
         lastActualRoutedModel,
-      ) ?? findBestRouterModelStats();
+      );
+      const realEntry = exactEntry ?? findBestRouterModelStats();
       if (realEntry) {
-        const statsText = formatCacheStats(realEntry.adapter, realEntry.stats);
+        const recentSamples = exactEntry
+          ? getRecentSamples(sessionModelKey(exactEntry.model))
+          : [];
+        const statsText = formatCacheStats(realEntry.adapter, realEntry.stats, recentSamples);
         statusText = runtimeOptimizerEnabled
           ? statsText
           : `缓存优化已关闭 · ${statsText}`;
@@ -4641,7 +4856,8 @@ export default function (pi: ExtensionAPI) {
       // cacheStatsByModel[sessionModelKey(displayModel)] on first use.
       const sk = displayModel ? sessionModelKey(displayModel) : undefined;
       const stats = sk ? cacheStatsByModel[sk] : undefined;
-      const statsText = formatCacheStats(adapter, stats ?? emptyCacheStats());
+      const recentSamples = sk ? getRecentSamples(sk) : [];
+      const statsText = formatCacheStats(adapter, stats ?? emptyCacheStats(), recentSamples);
       statusText = runtimeOptimizerEnabled ? statsText : `缓存优化已关闭 · ${statsText}`;
     }
 
@@ -4670,16 +4886,32 @@ export default function (pi: ExtensionAPI) {
 
   ensureRoutingRegistry();
 
-  pi.on("session_start", async (event, ctx) => {
-    await restoreCacheStats(event.reason, ctx);
+  pi.on("session_start", async (_event, ctx) => {
+    await restoreCacheStats(ctx);
     if (runtimeOptimizerEnabled) notifyCacheCompatIfNeeded(resolveRouteModel(ctx.model, ctx) ?? ctx.model, ctx, warnedModels);
     await publishStatus(ctx);
+  });
+  pi.on("session_before_switch", async (_event, ctx) => {
+    // message_end is fire-and-forget in agent-core. Drain handlers that already
+    // started before the host disconnects the old session, then persist its bucket.
+    await waitForPendingOperations(pendingMessageEndOperations);
+    await flushPersistCacheStats(ctx);
+  });
+  pi.on("session_switch", async (_event, ctx) => {
+    // Abort can emit one final message_end after session_before_switch. Drain it,
+    // persist the outgoing bucket, then load the target session. OMP emits this
+    // hook before restoring the target model, so model diagnostics wait for turn_start.
+    await waitForPendingOperations(pendingMessageEndOperations);
+    await flushPersistCacheStats(ctx);
+    await restoreCacheStats(ctx);
+    lastModelKeyForStatus = undefined;
   });
 
   // OMP divergence: model_select event may not exist in OMP (not listed in
   // hooks.md/extensions.md). Use turn_start + model-change detection instead.
   let lastModelKeyForStatus: string | undefined;
   pi.on("turn_start", async (_event, ctx) => {
+    await ensureActiveSessionStats(ctx);
     const model = resolveRouteModel(ctx.model, ctx) ?? ctx.model;
     const key = model ? modelKey(model) : undefined;
     if (key === lastModelKeyForStatus) return;
@@ -4691,6 +4923,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("before_agent_start", async (event, _ctx) => {
+    await ensureActiveSessionStats(_ctx);
     latestCacheHint = undefined;
     const routeSnapshot = resolveActiveRouteSnapshot(_ctx.model, _ctx);
     const routedModel = routeSnapshot
@@ -4705,7 +4938,11 @@ export default function (pi: ExtensionAPI) {
       timestamp: Date.now(),
     });
 
-    const promptCacheKey = getSessionPromptCacheKey(_ctx);
+    const resolvedPromptCacheKey = resolvePromptCacheKey(_ctx, model, {
+      allowProjectKey: runtimeOptimizerEnabled,
+      allowSessionFallback: true,
+    });
+    const promptCacheKey = resolvedPromptCacheKey?.key;
     const cacheRetention = readCacheRetentionValue(process.env) === LONG_CACHE_RETENTION_VALUE ? LONG_CACHE_RETENTION_VALUE : undefined;
 
     const publishHintFromBlocks = (blocks: string[]): void => {
@@ -4767,8 +5004,7 @@ export default function (pi: ExtensionAPI) {
     let mutated = false;
     let resultPayload = event.payload;
 
-    // 仅安全网：若 before_agent_start 未剥离 session-overview churn
-    //（钩子未跑 / 被后续覆盖），此处只 strip RECENT COMMITS，不做 skills/reorder。
+    // 安全网：session-overview 兜底 strip（不要求 RECENT COMMITS 同时存在）
     if (
       runtimeOptimizerEnabled &&
       isPromptRewriteEnabled() &&
@@ -4776,11 +5012,7 @@ export default function (pi: ExtensionAPI) {
       !isResponsesPromptRewriteBypassApi(requestModel.api)
     ) {
       const original = extractSystemPrompt(resultPayload);
-      if (
-        original &&
-        original.includes("<session-overview>") &&
-        original.includes("RECENT COMMITS")
-      ) {
+      if (original && original.includes("<session-overview>")) {
         const stripped = stripSessionOverviewChurn(original);
         if (stripped !== original && setSystemPrompt(resultPayload, stripped)) {
           mutated = true;
@@ -4789,160 +5021,126 @@ export default function (pi: ExtensionAPI) {
       }
     }
 
-    const requestDiagnosticsModel = requestModel ?? ctx.model;
-    if (requestDiagnosticsModel) {
-      const payloadPrompt = extractSystemPrompt(resultPayload);
-      const hintPrompt = latestCacheHint?.systemPrompt;
-      const header = ctx.sessionManager.getHeader?.();
-      pendingRequestDiagnosticsByModelKey.set(sessionModelKey(requestDiagnosticsModel), {
-        promptRewriteEnabled: isPromptRewriteEnabled(),
-        systemPromptFingerprint: fingerprintPrompt(payloadPrompt),
-        promptCacheKeySource: getPromptCacheKeySource(header, ctx.sessionManager.getSessionId()),
-        hintPayloadComparison: comparePromptFingerprints(
-          fingerprintPrompt(hintPrompt),
-          fingerprintPrompt(payloadPrompt),
-        ),
-      });
-    }
-
     // ── prompt_cache_key injection (OpenAI-compatible APIs) ──
-    // OMP 17 host injects prompt_cache_key into the body for openai-responses /
-    // azure-openai-responses, but NOT for openai-completions (chat) wire. We inject
-    // a cache key for ALL OpenAI-compatible APIs, but only when the payload doesn't
-    // already carry one — so responses (host-injected) are automatically skipped,
-    // and completions (host-skipped) get the key they need for proxy routing affinity.
-    // The key is read from the host header (providerPromptCacheKey) or session id fallback,
-    // and clamped to OpenAI's 64-char prompt_cache_key limit (see clampPromptCacheKey).
-    // For Anthropic / Google / other non-OpenAI APIs, prompt_cache_key is not a valid
-    // body parameter and isOpenAICompatibleApi excludes them.
+    // 真实 header key 优先；否则项目级稳定 key。只替换等于本地 sessionId 的 body fallback。
+    let resolvedProviderPromptCacheKey: ResolvedPromptCacheKey | undefined;
     if (runtimeOptimizerEnabled && isOpenAICompatibleApi(requestModel?.api)) {
-      const payloadRecord = asRecord(resultPayload);
-      const cacheKey = clampPromptCacheKey(getSessionPromptCacheKey(ctx));
-      if (
-        payloadRecord &&
-        isNonEmptyString(cacheKey) &&
-        !isNonEmptyString(payloadRecord.prompt_cache_key) &&
-        !isNonEmptyString(payloadRecord.promptCacheKey)
-      ) {
-        payloadRecord.prompt_cache_key = cacheKey;
-        mutated = true;
+      resolvedProviderPromptCacheKey = resolvePromptCacheKey(ctx, requestModel, {
+        allowProjectKey: true,
+        allowSessionFallback: false,
+      });
+      const cacheKey = normalizePromptCacheKeyForWire(resolvedProviderPromptCacheKey?.key);
+      if (cacheKey) {
+        const sessionId = firstNonEmptyString(ctx.sessionManager.getSessionId());
+        if (applyPromptCacheKeyToPayload(resultPayload, cacheKey, sessionId)) {
+          mutated = true;
+        }
       }
     }
 
-    // ── Safety: strip prompt_cache_retention for 400-history models ──
-    // OMP divergence: Pi defaults supportsLongCacheRetention to true for all
-    // openai-completions models and runs a 4-gate safety check. OMP's pi-ai
-    // only injects prompt_cache_retention when supportsLongPromptCacheRetention
-    // is explicitly true in models.yml (openai-responses path). We therefore
-    // need only two gates:
-    //   Gate 1 – user opt-in (supportsLongPromptCacheRetention: true) → keep
-    //   Gate 2 – 400 history (this process) → strip (overrides Gate 1)
-    // Gate 2 is critical: if the user opted in but the endpoint returned 400,
-    // we must strip — otherwise the 400 repeats every request.
+    // ── Safety: prompt_cache_retention 仅对 openai-responses + 显式 opt-in 保留 ──
     if (runtimeOptimizerEnabled) {
       const payloadRecord = asRecord(resultPayload);
       if (payloadRecord && typeof payloadRecord.prompt_cache_retention === "string") {
         const stripModel = resolveRouteModel(ctx.model, ctx) ?? ctx.model;
-        if (stripModel) {
-          if (promptCacheRetention400Models.has(modelKey(stripModel))) {
-            // Gate 2: 400 history → strip (empirical evidence overrides user opt-in)
-            delete payloadRecord.prompt_cache_retention;
-            mutated = true;
-          } else if (getCompat(stripModel).supportsLongPromptCacheRetention !== true) {
-            // Safety net: no explicit user opt-in → strip.
-            // pi-ai requires supportsLongPromptCacheRetention: true before it injects
-            // prompt_cache_retention; if the field is present without that compat flag,
-            // another source injected it — strip to prevent 400s on third-party proxies.
-            delete payloadRecord.prompt_cache_retention;
-            mutated = true;
-          }
-          // Implicit Gate 1: user opted in AND no 400 history → keep
+        const keep =
+          !!stripModel &&
+          isOpenAIResponsesLongRetentionApi(stripModel.api) &&
+          getCompat(stripModel).supportsLongPromptCacheRetention === true;
+        if (!keep) {
+          delete payloadRecord.prompt_cache_retention;
+          mutated = true;
         }
       }
+    }
+
+    // 请求级 prompt 诊断（不与 message_end usage 配对）
+    const requestDiagnosticsModel = requestModel ?? ctx.model;
+    if (requestDiagnosticsModel) {
+      const diagnosticsSessionHash = sessionHashFromContext(ctx) ?? (currentSessionHash || "_nosession");
+      recordPromptDiagnosticSample(makeSessionModelKey(diagnosticsSessionHash, requestDiagnosticsModel.provider, requestDiagnosticsModel.id), {
+        promptRewriteEnabled: isPromptRewriteEnabled(),
+        systemPromptFingerprint: fingerprintPrompt(extractSystemPrompt(resultPayload)),
+        promptCacheKeySource: getPromptCacheKeySource(
+          resultPayload,
+          requestModel?.api,
+          resolvedProviderPromptCacheKey,
+        ),
+      });
     }
 
     return mutated ? resultPayload : undefined;
   });
 
-  pi.on("after_provider_response", (event, ctx) => {
-    const model = resolveRouteModel(ctx.model, ctx) ?? ctx.model;
-    if (!runtimeOptimizerEnabled || !model) return;
-    if (event.status !== 400) return;
-    if (!isPromptCacheRetention400Applicable(model)) return;
-    if (!hasPromptCacheRetentionUnsupportedSignal(event.headers)) return;
+  pi.on("message_end", (event, ctx) => {
+    const operation = (async () => {
+      await ensureActiveSessionStats(ctx);
+      syncSessionHash(ctx);
+      const adapter = selectAdapterForAssistantMessage(event.message, ctx.model);
+      if (!adapter) return;
 
-    const key = modelKey(model);
-    promptCacheRetention400Models.add(key);
-    if (warnedPromptCacheRetention400Models.has(key)) return;
-    warnedPromptCacheRetention400Models.add(key);
-    ctx.ui.notify(
-      `⚠️ ${LOG_PREFIX}：${key} 在启用 supportsLongPromptCacheRetention 时返回了 HTTP 400。` +
-      getPromptCacheRetentionUnsupportedHint() +
-      ` 可运行 /cache-optimizer doctor 查看精确编辑位置。`,
-      "warning",
-    );
-  });
+      const usage = adapter.normalizeUsage(event.message);
 
-  pi.on("message_end", async (event, ctx) => {
-    syncSessionHash(ctx);
-    const adapter = selectAdapterForAssistantMessage(event.message, ctx.model);
-    if (!adapter) return;
-
-    const usage = adapter.normalizeUsage(event.message);
-
-    // Completed message metadata is request-local and authoritative for virtual
-    // routing providers. Use it whenever it supplies provider/model identity;
-    // fall back to the active context model for direct providers.
-    const statsModel = modelFromAssistantMessage(event.message, ctx.model) ?? ctx.model;
-    let routedModelChanged = false;
-    if (isVirtualRoutingModel(ctx.model, ctx) && statsModel && !isVirtualRoutingModel(statsModel, ctx)) {
-      const nextRoutedModel: PersistedRoutedModelRef = {
-        provider: statsModel.provider,
-        id: statsModel.id,
-        name: statsModel.name || statsModel.id,
-      };
-      if (
-        !lastActualRoutedModel ||
-        lastActualRoutedModel.provider !== nextRoutedModel.provider ||
-        lastActualRoutedModel.id !== nextRoutedModel.id ||
-        (lastActualRoutedModel.name || lastActualRoutedModel.id) !== (nextRoutedModel.name || nextRoutedModel.id)
-      ) {
-        lastActualRoutedModel = nextRoutedModel;
-        routedModelChanged = true;
+      // Completed message metadata is request-local and authoritative for virtual
+      // routing providers. Use it whenever it supplies provider/model identity;
+      // fall back to the active context model for direct providers.
+      const statsModel = modelFromAssistantMessage(event.message, ctx.model) ?? ctx.model;
+      let routedModelChanged = false;
+      if (isVirtualRoutingModel(ctx.model, ctx) && statsModel && !isVirtualRoutingModel(statsModel, ctx)) {
+        const nextRoutedModel: PersistedRoutedModelRef = {
+          provider: statsModel.provider,
+          id: statsModel.id,
+          name: statsModel.name || statsModel.id,
+        };
+        if (
+          !lastActualRoutedModel ||
+          lastActualRoutedModel.provider !== nextRoutedModel.provider ||
+          lastActualRoutedModel.id !== nextRoutedModel.id ||
+          (lastActualRoutedModel.name || lastActualRoutedModel.id) !== (nextRoutedModel.name || nextRoutedModel.id)
+        ) {
+          lastActualRoutedModel = nextRoutedModel;
+          routedModelChanged = true;
+        }
       }
-    }
 
-    // Record recent sample (even when usage is missing, for trend diagnosis)
-    if (statsModel) {
-      const sk = sessionModelKey(statsModel);
-      const missingFields = usage === undefined || (usage.cacheRead === 0 && usage.cacheWrite === 0 && usage.totalInput === 0)
-        ? true
-        : hasMissingUsageFields(event.message, adapter);
-      const diagnostics = pendingRequestDiagnosticsByModelKey.get(sk)
-        ?? (ctx.model ? pendingRequestDiagnosticsByModelKey.get(sessionModelKey(ctx.model)) : undefined);
-      pendingRequestDiagnosticsByModelKey.delete(sk);
-      if (ctx.model) pendingRequestDiagnosticsByModelKey.delete(sessionModelKey(ctx.model));
-      recordRecentSample(sk, usage ?? { cacheRead: 0, cacheWrite: 0, totalInput: 0 }, missingFields, diagnostics);
-    }
+      const effectiveUsage = usage ?? { cacheRead: 0, cacheWrite: 0, totalInput: 0 };
+      const assistantRecord = getAssistantRecord(event.message);
+      const stopReason = lower(assistantRecord?.stopReason);
+      const failedWithoutUsage =
+        (stopReason === "error" || stopReason === "aborted") && effectiveUsage.totalInput <= 0;
 
-    if (!usage) {
-      if (routedModelChanged) schedulePersistCacheStats(ctx);
-      return;
-    }
+      // Record recent usage sample for trend diagnosis. A successful request may
+      // legitimately have all-zero usage when a streaming proxy omits usage data.
+      if (statsModel) {
+        const sk = sessionModelKey(statsModel);
+        const missingFields = usage === undefined || (usage.cacheRead === 0 && usage.cacheWrite === 0 && usage.totalInput === 0)
+          ? true
+          : hasMissingUsageFields(event.message, adapter);
+        recordRecentSample(sk, effectiveUsage, missingFields);
+      }
 
-    await rollOverStatsIfNeeded(ctx);
+      // Only failed/aborted all-zero attempts are excluded. Successful all-zero
+      // responses still count as requests, while contributing no token denominator.
+      if (failedWithoutUsage) {
+        if (routedModelChanged) schedulePersistCacheStats(ctx);
+        return;
+      }
 
-    // Update stats scoped to current session + actual routed model.
-    // Falls back to legacy family when no model is available.
-    if (statsModel) {
-      const sk = sessionModelKey(statsModel);
-      addUsageToCacheStats(getOrCreateStatsByModelKey(sk), usage);
-    } else {
-      addUsageToCacheStats(getStatsForModel(undefined, adapter), usage);
-    }
+      await rollOverStatsIfNeeded(ctx);
 
-    schedulePersistCacheStats(ctx);
-    await publishStatus(ctx, statsModel);
+      // Update stats scoped to current session + actual routed model.
+      // Falls back to legacy family when no model is available.
+      if (statsModel) {
+        const sk = sessionModelKey(statsModel);
+        addUsageToCacheStats(getOrCreateStatsByModelKey(sk), effectiveUsage);
+      } else {
+        addUsageToCacheStats(getStatsForModel(undefined, adapter), effectiveUsage);
+      }
+
+      schedulePersistCacheStats(ctx);
+      await publishStatus(ctx, statsModel);
+    })();
+    return trackPendingOperation(pendingMessageEndOperations, operation);
   });
 
   // ────────────────────────────────────────────────────────────────
@@ -4961,7 +5159,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("cache-optimizer", {
     description: "Diagnose OMP cache configuration",
     handler: async (args: string, cmdCtx) => {
-      syncSessionHash(cmdCtx);
+      await ensureActiveSessionStats(cmdCtx as unknown as ExtensionContext);
       const selectedModel = cmdCtx.model;
       const model = resolveRouteModel(selectedModel, cmdCtx as unknown as ExtensionContext) ?? selectedModel;
       const subcommand = args.trim().toLowerCase().split(/\s+/)[0] || "help";
@@ -4983,12 +5181,13 @@ export default function (pi: ExtensionAPI) {
           cmdCtx.ui.notify("当前没有活动模型。请先用 /model 或 omp --model 选择模型。", "warning");
           return;
         }
-        const diagnosis = buildDoctorDiagnosis(model, { promptCacheRetention400: promptCacheRetention400Models.has(modelKey(model)) });
+        const diagnosis = buildDoctorDiagnosis(model);
         const adapter = selectAdapterForModel(model);
         const sk = model ? sessionModelKey(model) : undefined;
         const statsState = sk ? cacheStatsByModel[sk] : undefined;
         const samples = sk ? getRecentSamples(sk) : [];
-        const lowHitLines = buildLowHitDiagnosis(model, adapter, statsState, samples);
+        const promptSamples = sk ? getRecentPromptDiagnostics(sk) : [];
+        const lowHitLines = buildLowHitDiagnosis(model, adapter, statsState, samples, promptSamples);
         const fullDiagnosis = lowHitLines.length > 0
           ? diagnosis + "\n" + lowHitLines.join("\n")
           : diagnosis;
@@ -5002,7 +5201,8 @@ export default function (pi: ExtensionAPI) {
         const sk = model ? sessionModelKey(model) : undefined;
         const statsState = sk ? cacheStatsByModel[sk] : undefined;
         const samples = sk ? getRecentSamples(sk) : [];
-        const output = buildStatsOutput(model, adapter, statsState, samples);
+        const promptSamples = sk ? getRecentPromptDiagnostics(sk) : [];
+        const output = buildStatsOutput(model, adapter, statsState, samples, promptSamples);
         cmdCtx.ui.notify(output, "info");
       } else if (subcommand === "compat") {
         if (!model) {
@@ -5111,12 +5311,13 @@ export default function (pi: ExtensionAPI) {
             if (!model) {
               cmdCtx.ui.notify("当前没有活动模型。请先用 /model 或 omp --model 选择模型。", "warning");
             } else {
-              const diagnosis = buildDoctorDiagnosis(model, { promptCacheRetention400: promptCacheRetention400Models.has(modelKey(model)) });
+              const diagnosis = buildDoctorDiagnosis(model);
               const adapter = selectAdapterForModel(model);
               const sk = model ? sessionModelKey(model) : undefined;
               const statsState = sk ? cacheStatsByModel[sk] : undefined;
               const samples = sk ? getRecentSamples(sk) : [];
-              const lowHitLines = buildLowHitDiagnosis(model, adapter, statsState, samples);
+              const promptSamples = sk ? getRecentPromptDiagnostics(sk) : [];
+              const lowHitLines = buildLowHitDiagnosis(model, adapter, statsState, samples, promptSamples);
               const fullDiagnosis = lowHitLines.length > 0
                 ? diagnosis + "\n" + lowHitLines.join("\n")
                 : diagnosis;
@@ -5130,7 +5331,8 @@ export default function (pi: ExtensionAPI) {
               const sk = model ? sessionModelKey(model) : undefined;
               const statsState = sk ? cacheStatsByModel[sk] : undefined;
               const samples = sk ? getRecentSamples(sk) : [];
-              const output = buildStatsOutput(model, adapter, statsState, samples);
+              const promptSamples = sk ? getRecentPromptDiagnostics(sk) : [];
+              const output = buildStatsOutput(model, adapter, statsState, samples, promptSamples);
               cmdCtx.ui.notify(output, "info");
             }
           } else if (choice === menuOptions[4]) {

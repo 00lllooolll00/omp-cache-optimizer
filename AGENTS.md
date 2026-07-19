@@ -10,17 +10,17 @@ OMP Cache Optimizer (npm: `omp-cache-optimizer`) is a single-file TypeScript OMP
 OMP Runtime (host, Bun-based)
   │
   ├─ session_start        → restore persisted stats, sync session hash
-  ├─ turn_start           → model-change detection, publish footer status
-  ├─ before_agent_start   → 主 prompt 重写（string[] 块：仅 <session-overview> churn strip，保持块顺序与内容）
+  ├─ session_before_switch / session_switch → drain in-flight message_end, flush outgoing stats, restore target-session stats
+  ├─ turn_start           → model-change/rollback detection, publish footer status after target model restore
+  ├─ before_agent_start   → 可选主 prompt 重写（`OMP_CACHE_OPTIMIZER_PROMPT_REWRITE=1` 时：string[] 块仅 <session-overview> churn strip，保持块顺序与内容）
   │                         + route snapshot + cache hint
-  ├─ before_provider_request → 安全网：session-overview 兜底 strip + prompt_cache_retention 安全网 + prompt_cache_key 兜底注入（OpenAI-compatible）
-  ├─ after_provider_response → detect 400 compat signals
+  ├─ before_provider_request → 可选 session-overview 兜底 strip + prompt_cache_retention 安全网 + prompt_cache_key 兜底注入（OpenAI-compatible）
   └─ message_end          → scrape OMP-normalized usage, persist stats, publish footer
 ```
 
 - **Single-file monolith**: All logic lives in `index.ts` (~5,100 lines). No `src/` tree.
 - **Extension entry**: `export default function (pi: ExtensionAPI) { … }` — registers hooks + `/cache-optimizer` command.
-- **Prompt rewriting in `before_agent_start`**：OMP 17 适配。仅对 `event.systemPrompt: string[]` 块数组逐块调用 `stripSessionOverviewChurn()`，保持块顺序与 skill 描述逐字不变，不压缩、不重排。`before_provider_request` 做 payload 级 session-overview 兜底 strip、`prompt_cache_retention` 安全网，并为 OpenAI-compatible API（host 不注入的 openai-completions chat wire）兜底注入 body `prompt_cache_key`（读 header `providerPromptCacheKey` ?? sessionId，截断 64 字符，payload 已有则不覆盖）。`extractSystemPrompt()` / `setSystemPrompt()` 处理 `payload.system`（Anthropic）、`payload.systemInstruction`（Google）、`payload.messages[0].content`（OpenAI）形态。
+- **Prompt rewriting in `before_agent_start`**：OMP 17 适配。**默认不改写 prompt**；仅当 `OMP_CACHE_OPTIMIZER_PROMPT_REWRITE=1` 时，对 `event.systemPrompt: string[]` 块数组逐块调用 `stripSessionOverviewChurn()`，保持块顺序与 skill 描述逐字不变，不压缩、不重排。`before_provider_request` 仅在该变量启用时做 payload 级 session-overview 兜底 strip；始终负责 `prompt_cache_retention` 安全网，并为五种 OpenAI-compatible API（`openai-completions` / `openai-responses` / `openrouter` / `openai-codex-responses` / `azure-openai-responses`）解析 body `prompt_cache_key`：稳定 header 优先；否则使用项目级稳定哈希 key；已有非 session 自定义 body key 不覆盖，sessionId 级 body key 会被替换；超长 body key 经 `normalizePromptCacheKeyForWire` 无碰撞哈希归一化（`pc_` + 48 hex）。`extractSystemPrompt()` / `setSystemPrompt()` 处理 `payload.system`（Anthropic）、`payload.systemInstruction`（Google）、`payload.messages[0].content`（OpenAI）以及 Responses 顶层 `instructions`（仅诊断指纹）形态。
 - **Adapter pattern**: `CACHE_PROVIDER_ADAPTERS` array of ~50 adapter objects. Selected by token-matching on model id/name.
 - **Stats persistence**: Session-scoped, versioned JSON at `~/.omp/agent/omp-cache-optimizer-stats.json` (v5 format). Atomic writes via temp + rename. Never persists prompts, payloads, or API keys.
 - **Inter-extension protocol**: Two `Symbol.for` global registries — `omp.routing.registry.v1` (live routing) and `omp.cache.hints.v1` (pre-request hints).
@@ -76,9 +76,9 @@ Each `CacheProviderAdapter` defines: `id`, `label`, `matchesModel(model)`, `matc
 
 ### Prompt Optimization Pipeline (in `before_agent_start`)
 
-1. `stripSessionOverviewChurn()` — 逐块移除 `<session-overview>` 中的易变字段（RECENT COMMITS、Working directory、Line count），保持块顺序与 skill 描述逐字不变。不压缩 skills、不重排块。
+1. `stripSessionOverviewChurn()` — **仅当** `OMP_CACHE_OPTIMIZER_PROMPT_REWRITE=1` 时启用。逐块移除 `<session-overview>` 中的易变字段（RECENT COMMITS、Working directory、Line count），保持块顺序与 skill 描述逐字不变。不压缩 skills、不重排块。
 
-`before_provider_request` 安全网：若 `before_agent_start` 未跑或被覆盖，对 payload 中的 system prompt 兜底 strip session-overview churn；并按 400-history 与 compat 对 `prompt_cache_retention` 做安全 strip。另为 OpenAI-compatible API（openai-completions / openai-responses）在 payload 缺失时兜底注入 `prompt_cache_key`（读 header `providerPromptCacheKey` ?? sessionId，截断 64 字符防 400，payload 已有则不覆盖）。
+`before_provider_request` 安全网：若改写开关开启且 `before_agent_start` 未跑或被覆盖，对 payload 中的 system prompt 兜底 strip session-overview churn；并按 endpoint + compat 对 `prompt_cache_retention` 做安全 strip（仅字面 `openai-responses` + `supportsLongPromptCacheRetention` 可保留）。另为五种 OpenAI-compatible API（含会在 OMP 内部分派到 Responses 或 Completions 的 `openrouter`）在 payload 缺失或仅为 session 级 key 时注入/替换 `prompt_cache_key`（稳定 header 优先，否则项目级稳定哈希；不把每会话 sessionId 当路由 key；超长 key 用 `normalizePromptCacheKeyForWire` 哈希，cache hint 仍保留完整 host key）。
 
 ### `/cache-optimizer fix` — Current Status
 
@@ -94,9 +94,9 @@ The original project's auto-write safety protocol (backup → preview + confirma
 
 | 变量 | 作用 |
 |---|---|
-| `OMP_CACHE_OPTIMIZER_NO_PROMPT_REWRITE=1` | 关闭 prompt 改写（session-overview churn strip） |
+| `OMP_CACHE_OPTIMIZER_PROMPT_REWRITE=1` | **显式开启** prompt 改写（session-overview churn strip）。未设置时保持 OMP 原始 prompt。 |
 
-旧 `PI_CACHE_OPTIMIZER_*` 前缀读取时仍兼容。
+旧 `OMP_CACHE_OPTIMIZER_NO_PROMPT_REWRITE` / `PI_CACHE_OPTIMIZER_NO_PROMPT_REWRITE` 已不再受支持。主前缀为 `OMP_`；宿主 `pi-ai` 仍读 `PI_CACHE_RETENTION`，扩展写入 long 时会同步镜像。
 
 ## Important Files
 
